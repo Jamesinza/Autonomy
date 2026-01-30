@@ -221,22 +221,31 @@ def create_tf_dataset(inputs, labels, batch_size=128, shuffle=False, repeat_epoc
 # 6. Training loop with hypernetwork integration.
 # =============================================================================
 def train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_interval=100,
-                plasticity_start_epoch=15, plasticity_update_interval=10):
+                plasticity_start_epoch=5, plasticity_update_interval=10):
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
+    
+    # Global parameters for self-tuning of plasticity updates.
+    global_plasticity_weight_multiplier = 0.4  # Initial multiplier for plasticity updates.
+    global_reward_scaling_factor = 0.1         # Initial reward scaling factor.
+    
+    # Thresholds for self-adjustment.
+    DELTA_MEAN_LOWER_BOUND = 1e-4  # If plasticity delta mean is below this, too weak.
+    DELTA_MEAN_UPPER_BOUND = 1e-3  # If plasticity delta mean is above this, too strong.
+    DELTA_STD_UPPER_BOUND = 1e-2     # If std is too high, updates might be unstable.
     
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
     
     global_step = 0
     for epoch in range(num_epochs):
-        # Delay plasticity until after baseline period and ramp-up gradually.
+        # Ramp up plasticity weight gradually after a baseline period.
         if epoch < plasticity_start_epoch:
             plasticity_weight = 0.0
         else:
             plasticity_weight = (epoch - plasticity_start_epoch + 1) / (num_epochs - plasticity_start_epoch + 1)
-            # Even further scale down the plasticity update initially.
-            plasticity_weight *= 0.5
+            # Further scale the ramp-up with the global multiplier.
+            plasticity_weight *= global_plasticity_weight_multiplier
 
         for images, labels in ds_train:
             with tf.GradientTape() as tape:
@@ -253,20 +262,32 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_in
             x_flat = model.flatten(images)
             pre_activity = tf.reduce_mean(x_flat, axis=0)
             post_activity = tf.reduce_mean(hidden, axis=0)
-            # Rescale reward to soften plasticity update effect.
-            reward = 0.1 * tf.sigmoid(-loss)
+            # Rescale the reward with the global reward scaling factor.
+            reward = global_reward_scaling_factor * tf.sigmoid(-loss)
             
-            # Only apply plasticity update at defined intervals.
+            # Apply plasticity update only at defined intervals.
             if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
                 plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
                 # Scale the plasticity update by the current plasticity weight.
                 plasticity_delta *= plasticity_weight
                 model.hidden.apply_plasticity(plasticity_delta)
                 
-                # Log some plasticity statistics.
+                # Compute statistics for the plasticity update.
                 delta_mean = tf.reduce_mean(tf.abs(plasticity_delta))
                 delta_std = tf.math.reduce_std(plasticity_delta)
-                # print(f"Step {global_step}: Plasticity delta mean = {delta_mean:.6f}, std = {delta_std:.6f}")
+                print(f"Step {global_step}: Plasticity delta mean = {delta_mean:.6f}, std = {delta_std:.6f}")
+                
+                # Self-tuning mechanism: adjust if updates are too weak or too strong.
+                if delta_mean < DELTA_MEAN_LOWER_BOUND:
+                    global_plasticity_weight_multiplier *= 1.2
+                    global_reward_scaling_factor *= 1.2
+                    print(f"  [Adjustment Up] New plasticity multiplier: {global_plasticity_weight_multiplier:.4f}, "
+                          f"New reward scaling: {global_reward_scaling_factor:.4f}")
+                elif delta_mean > DELTA_MEAN_UPPER_BOUND or delta_std > DELTA_STD_UPPER_BOUND:
+                    global_plasticity_weight_multiplier *= 0.8
+                    global_reward_scaling_factor *= 0.8
+                    print(f"  [Adjustment Down] New plasticity multiplier: {global_plasticity_weight_multiplier:.4f}, "
+                          f"New reward scaling: {global_reward_scaling_factor:.4f}")
             
             if global_step % homeostasis_interval == 0:
                 model.hidden.apply_homeostatic_scaling()
@@ -274,8 +295,8 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_in
             
             global_step += 1
         
-        print(f"\nEpoch {epoch+1}/{num_epochs}\nTrain Loss : {train_loss.result():.4f}, "
-              f"Train Accuracy : {train_accuracy.result():.4f}, Plasticity Weight : {plasticity_weight:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}\nTrain Loss : {train_loss.result():.4f}, "
+              f"Train Accuracy : {train_accuracy.result():.4f}, Plasticity Weight : {plasticity_weight:.6f}")
         train_loss.reset_state()
         train_accuracy.reset_state()
         
@@ -299,7 +320,7 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_in
             test_accuracy_metric(labels, predictions)
         print(f"Test Loss  : {test_loss_metric.result():.4f}, Test Accuracy  : {test_accuracy_metric.result():.4f}")
     
-    model.save("models/MetaSynapse_v6b.keras")
+    model.save("models/MetaSynapse_v6c.keras")
     
 # =============================================================================
 # 7. Main: Create dataset, instantiate models, and train.
