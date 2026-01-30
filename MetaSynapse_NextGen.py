@@ -48,10 +48,15 @@ class RecurrentPlasticityController(tf.keras.layers.Layer):
         """
         super(RecurrentPlasticityController, self).__init__(**kwargs)
         self.sequence_length = sequence_length
-        self.gru = tf.keras.layers.GRU(units, return_sequences=False)
-        self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=units)
+        self.units = units
+        
+    def build(self, input_shape):
+        self.gru = tf.keras.layers.GRU(self.units, return_sequences=False)
+        self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=self.units)
         self.flatten = tf.keras.layers.Flatten()
         self.dense = tf.keras.layers.Dense(2, activation=None)
+        super(RecurrentPlasticityController, self).build(input_shape)
+        
     @tf.function
     def call(self, input_sequence):
         """
@@ -102,10 +107,14 @@ class DynamicConnectivity(tf.keras.layers.Layer):
     def __init__(self, max_units, **kwargs):
         super(DynamicConnectivity, self).__init__(**kwargs)
         self.max_units = max_units
+        
+    def build(self, input_shape):
         self.attention_net = tf.keras.Sequential([
             tf.keras.layers.Dense(32, activation='relu'),
-            tf.keras.layers.Dense(max_units, activation='sigmoid')  # Outputs in [0,1]
+            tf.keras.layers.Dense(self.max_units, activation='sigmoid')  # Outputs in [0,1]
         ])
+        super(DynamicConnectivity, self).build(input_shape)
+        
     @tf.function    
     def call(self, neuron_features):
         # neuron_features shape: (batch, max_units)
@@ -296,16 +305,23 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
     def __init__(self, num_experts, max_units, initial_units, plasticity_controller, **kwargs):
         super(MoE_DynamicPlasticLayer, self).__init__(**kwargs)
         self.num_experts = num_experts
+        self.max_units = max_units
+        self.initial_units = initial_units
+        self.plasticity_controller = plasticity_controller
+        
+    def build(self, input_shape):
         # Instantiate several experts (each an instance of your existing dynamic plastic dense layer).
         self.experts = [
-            DynamicPlasticDenseAdvancedHyperV2(max_units, initial_units, plasticity_controller)
-            for _ in range(num_experts)
+            DynamicPlasticDenseAdvancedHyperV2(self.max_units, self.initial_units, self.plasticity_controller)
+            for _ in range(self.num_experts)
         ]
         # A gating network that assigns a weight to each expert based on the input.
         self.gating_network = tf.keras.Sequential([
-            tf.keras.layers.Dense(num_experts*2, activation='relu'),
-            tf.keras.layers.Dense(num_experts, activation='softmax')
+            tf.keras.layers.Dense(self.num_experts*2, activation='relu'),
+            tf.keras.layers.Dense(self.num_experts, activation='softmax')
         ])
+        super(MoE_DynamicPlasticLayer, self).build(input_shape)
+        
     @tf.function
     def call(self, inputs):
         # Process the input through each expert.
@@ -533,8 +549,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                 if best_weights is not None:
                     print("Restoring best weights and saving model.\n")
                     model.set_weights(best_weights)
-                    model.save("models/MetaSynapse_NextGen_v3c.keras")
-                    model.unsupervised_extractor.save("models/unsupervised_extractor_v3c.keras")
+                    model.save("models/MetaSynapse_NextGen_v3d.keras")
                     patience_counter = 0
                 #break  # Exit the epoch loop.
 
@@ -637,7 +652,7 @@ def main():
     learning_rate=1e-4
     
     # Load data.
-    sequence = get_real_data(num_samples=1_000)
+    sequence = get_real_data(num_samples=10_000)
     inputs, labels = create_windows(sequence, window_size=window_size+1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
     
