@@ -2,13 +2,14 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 import collections
+import random
 
 # Set random seeds for reproducibility
 np.random.seed(42)
 tf.random.set_seed(42)
 
 # -----------------------------------------------------------------------------
-# 1. LearnedActivation remains as before.
+# 1. LearnedActivation.
 # -----------------------------------------------------------------------------
 class LearnedActivation(tf.keras.layers.Layer):
     def __init__(self, **kwargs):
@@ -71,6 +72,7 @@ class DynamicPlasticDenseAdvancedHyper(tf.keras.layers.Layer):
         self.hypernetwork = hypernetwork
         self.decay_factor = decay_factor
         self.initial_target = initial_target
+        self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)
         
         # Create a binary mask for active neurons: 1 = active, 0 = inactive.
         init_mask = [1] * initial_units + [0] * (max_units - initial_units)
@@ -95,19 +97,17 @@ class DynamicPlasticDenseAdvancedHyper(tf.keras.layers.Layer):
         super(DynamicPlasticDenseAdvancedHyper, self).build(input_shape)
     
     def call(self, inputs):
-        # Compute linear combination for all candidate neurons.
-        z = tf.matmul(inputs, self.w) + self.b  # shape: (batch, max_units)
-        # Mask out inactive neurons.
-        z_masked = z * self.neuron_mask
-        # Apply activation (ReLU in this example).
-        a = tf.keras.activations.relu(z_masked)
-        
-        # Update running average activation per neuron (simple EMA).
-        batch_mean = tf.reduce_mean(a, axis=0)  # shape: (max_units,)
+        z = tf.matmul(inputs, self.w) + self.b  # (batch, max_units)
+        # Use running average as a proxy for neuron features (expand dims to mimic batch if needed)
+        avg_activation = tf.expand_dims(self.neuron_activation_avg, axis=0)  # shape: (1, max_units)
+        connectivity = self.dynamic_connectivity(avg_activation)  # shape: (1, max_units)
+        z_mod = z * connectivity  # elementwise modulation instead of fixed mask
+        a = tf.keras.activations.relu(z_mod)
+        # Update running average activation (same as before)
+        batch_mean = tf.reduce_mean(a, axis=0)
         alpha = 0.9
         new_avg = alpha * self.neuron_activation_avg + (1 - alpha) * batch_mean
         self.neuron_activation_avg.assign(new_avg)
-        
         return a
 
     def plasticity_update(self, pre_activity, post_activity, reward):
@@ -123,7 +123,7 @@ class DynamicPlasticDenseAdvancedHyper(tf.keras.layers.Layer):
         features = tf.stack([pre_tile, post_tile, w_val, random_delta], axis=-1)  # shape: (in_features, total_neurons, 4)
         features_flat = tf.reshape(features, [-1, 4])
         hyper_params_flat = self.hypernetwork(features_flat)  # shape: (in_features * total_neurons, 2)
-        # Fix: Append the new dimension correctly.
+        # Append the new dimension correctly.
         new_shape = tf.concat([tf.shape(self.w), [2]], axis=0)
         hyper_params = tf.reshape(hyper_params_flat, new_shape)
         delta_add = hyper_params[..., 0]
@@ -141,7 +141,7 @@ class DynamicPlasticDenseAdvancedHyper(tf.keras.layers.Layer):
         self.w.assign(self.w * scaling_factor)
     
     def apply_structural_plasticity(self):
-        # (Optional) Prune individual connections that are too small.
+        # Prune individual connections that are too small.
         pruned_w = tf.where(tf.abs(self.w) < 0.01, tf.zeros_like(self.w), self.w)
         self.w.assign(pruned_w)
     
@@ -191,7 +191,219 @@ class PlasticityModelHyper(tf.keras.Model):
         return output, hidden_act
 
 # -----------------------------------------------------------------------------
-# 5. Data loading functions.
+# 5. MetaPlasticityController: Nested meta-controller for hyperparameter tuning.
+# -----------------------------------------------------------------------------
+class MetaPlasticityController(tf.keras.layers.Layer):
+    def __init__(self, hidden_units=16, **kwargs):
+        super(MetaPlasticityController, self).__init__(**kwargs)
+        self.dense1 = tf.keras.layers.Dense(hidden_units, activation=LearnedActivation())
+        self.dense2 = tf.keras.layers.Dense(hidden_units, activation=LearnedActivation())
+        # Output adjustments for [plasticity_multiplier_delta, reward_scaling_delta]
+        self.out = tf.keras.layers.Dense(2, activation='tanh')  # tanh to bound adjustments
+
+    def call(self, inputs):
+        # inputs: a vector with [mean_error, std_error, current_multiplier, current_reward_scaling]
+        x = self.dense1(inputs)
+        x = self.dense2(x)
+        adjustments = self.out(x)
+        return adjustments
+        
+# -----------------------------------------------------------------------------
+# 6. Dynamic Connectivity.
+# -----------------------------------------------------------------------------
+class DynamicConnectivity(tf.keras.layers.Layer):
+    def __init__(self, max_units, **kwargs):
+        super(DynamicConnectivity, self).__init__(**kwargs)
+        self.max_units = max_units
+        self.attention_net = tf.keras.Sequential([
+            tf.keras.layers.Dense(16, activation=LearnedActivation()),
+            tf.keras.layers.Dense(max_units, activation='sigmoid')  # outputs in [0,1]
+        ])
+    
+    def call(self, neuron_features):
+        # neuron_features shape: (batch, max_units)
+        connectivity = self.attention_net(neuron_features)
+        return connectivity
+        
+# -----------------------------------------------------------------------------
+# 7. Training loop with nested meta-plasticity.
+# -----------------------------------------------------------------------------
+def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=1000,
+                homeostasis_interval=100, architecture_update_interval=100,
+                plasticity_start_epoch=3, plasticity_update_interval=10):
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
+    chaos_state = 0.5  # initial chaos state
+    
+    # Initialize a population of meta-controllers (e.g., size 3)
+    population_size = 3
+    meta_controllers = [MetaPlasticityController(hidden_units=16) for _ in range(population_size)]
+    # Warm-up: feed a dummy input to each so they’re built.
+    for mc in meta_controllers:
+        _ = mc(tf.zeros((1, 4)))
+    
+    # Initialize plasticity weight and reward scaling (now controlled by meta_controller).
+    global_plasticity_weight_multiplier = tf.Variable(0.5, trainable=False, dtype=tf.float32)
+    global_reward_scaling_factor = tf.Variable(0.1, trainable=False, dtype=tf.float32)
+
+    # Define optimal target values for mean and std of plasticity delta.
+    MEAN_MIN, MEAN_MAX = 1e-4, 1e-3
+    STD_MIN, STD_MAX = 5e-4, 1e-2
+    OPTIMAL_MEAN = (MEAN_MIN + MEAN_MAX) / 2
+    OPTIMAL_STD = (STD_MIN + STD_MAX) / 2
+
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+    
+    global_step = 0
+    for epoch in range(num_epochs):
+        batch_errors = []
+        plasticity_weight = ((epoch - plasticity_start_epoch + 1) / 
+                             (num_epochs - plasticity_start_epoch + 1)) if epoch >= plasticity_start_epoch else 0.0
+        plasticity_weight *= global_plasticity_weight_multiplier.numpy()  # use current multiplier
+
+        for images, labels in ds_train:
+            with tf.GradientTape() as tape:
+                predictions, hidden = model(images, training=True)
+                loss = loss_fn(labels, predictions)
+                
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            
+            # Store absolute batch error
+            batch_errors.append(loss.numpy())  # Convert to NumPy for tracking            
+            
+            train_loss(loss)
+            train_accuracy(labels, predictions)
+            
+            x_flat = model.flatten(images)
+            pre_activity = tf.reduce_mean(x_flat, axis=0)
+            post_activity = tf.reduce_mean(hidden, axis=0)
+            
+            # Compute combined reward.
+            reward = global_reward_scaling_factor.numpy() * compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0)
+            
+            if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
+                chaos_state = chaotic_modulation(chaos_state)
+                neuromod_signal = compute_neuromodulatory_signal(predictions, reward)
+                plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
+                
+                # modulate plasticity update with the chaotic signal
+                # gate the plasticity update by the neuromodulatory signal
+                plasticity_delta *= plasticity_weight * chaos_state * neuromod_signal
+                # apply modulated plasticity_delta
+                model.hidden.apply_plasticity(plasticity_delta)
+                
+                # Compute mean and std of plasticity updates.
+                delta_mean = tf.reduce_mean(tf.abs(plasticity_delta))
+                delta_std = tf.math.reduce_std(plasticity_delta)
+
+                # Calculate errors with respect to optimal values.
+                mean_error = delta_mean - OPTIMAL_MEAN
+                std_error = delta_std - OPTIMAL_STD
+
+                # Instead of using one meta_controller, randomly select one from the population:
+                selected_mc = random.choice(meta_controllers)
+                meta_input = tf.convert_to_tensor([[mean_error, std_error,
+                                                     global_plasticity_weight_multiplier.numpy(),
+                                                     global_reward_scaling_factor.numpy()]], dtype=tf.float32)
+                adjustments = selected_mc(meta_input)
+                adjust_factor = 0.05
+                new_multiplier = global_plasticity_weight_multiplier * (1.0 + adjust_factor * adjustments[0, 0])
+                new_reward_scaling = global_reward_scaling_factor * (1.0 + adjust_factor * adjustments[0, 1])
+                new_multiplier = tf.clip_by_value(new_multiplier, 0.01, 5.0)
+                new_reward_scaling = tf.clip_by_value(new_reward_scaling, 0.01, 5.0)
+                global_plasticity_weight_multiplier.assign(new_multiplier)
+                global_reward_scaling_factor.assign(new_reward_scaling)
+            
+            if global_step % homeostasis_interval == 0:
+                model.hidden.apply_homeostatic_scaling()
+                model.hidden.apply_structural_plasticity()
+            
+            if global_step % architecture_update_interval == 0:
+                model.hidden.apply_architecture_modification()
+            
+            global_step += 1
+
+        # Compute epoch-level error statistics
+        mean_error = np.mean(batch_errors)
+        std_error = np.std(batch_errors)
+        
+        if epoch % 10 == 0:
+            # Dummy fitness evaluation – here, lower errors indicate better performance.
+            fitness_scores = []
+            for mc in meta_controllers:
+                # Here we evaluate based on historical performance metrics;
+                # we use negative absolute error (the lower the errors, the better).
+                fitness = - (abs(mean_error) + abs(std_error))
+                fitness_scores.append(fitness)
+            best_idx = np.argmax(fitness_scores)
+            best_mc = meta_controllers[best_idx]
+            # Evolve the rest of the population by cloning best_mc with slight mutation.
+            for i, mc in enumerate(meta_controllers):
+                if i != best_idx:
+                    new_weights = [w + tf.random.normal(w.shape, stddev=0.01) for w in best_mc.get_weights()]
+                    mc.set_weights(new_weights)
+    
+        # Validation Evaluation.
+        val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
+        val_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
+        for images, labels in ds_val:
+            predictions, _ = model(images, training=False)
+            loss_val = loss_fn(labels, predictions)
+            val_loss_metric(loss_val)
+            val_accuracy_metric(labels, predictions)
+        
+        # Test Evaluation.
+        test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
+        test_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
+        for images, labels in ds_test:
+            predictions, _ = model(images, training=False)
+            loss_test = loss_fn(labels, predictions)
+            test_loss_metric(loss_test)
+            test_accuracy_metric(labels, predictions)
+
+        print(f"\nEpoch {epoch+1}/{num_epochs}\n")
+        print(f"Mean Error : {mean_error:.4f}, Std Error     : {std_error:.4f}")
+        print(f"Train Loss : {train_loss.result():.4f}, Train Accuracy: {train_accuracy.result():.4f}, Plasticity Weight: {plasticity_weight:.6f}")
+        print(f"Val Loss   : {val_loss_metric.result():.4f}, Val Accuracy  : {val_accuracy_metric.result():.4f}")
+        print(f"Test Loss  : {test_loss_metric.result():.4f}, Test Accuracy : {test_accuracy_metric.result():.4f}")
+                
+        train_loss.reset_state()
+        train_accuracy.reset_state()
+    
+    model.save("models/MetaSynapse_vNested.keras")
+    
+def chaotic_modulation(c, r=3.8):
+    # Simple logistic map – note: c must remain in (0, 1)
+    return r * c * (1 - c)
+    
+def compute_neuromodulatory_signal(predictions, external_reward=0.0):
+    # Compute entropy as a proxy for uncertainty
+    entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
+    # Combine average entropy with an external reward signal; higher values yield stronger gating.
+    modulation = tf.sigmoid(external_reward + tf.reduce_mean(entropy))
+    return modulation
+    
+def compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0):
+    """
+    Combines multiple signals into a reinforcement reward.
+      - Loss-based signal: tf.sigmoid(-loss)
+      - Novelty signal: standard deviation of hidden activations.
+      - Uncertainty signal: average entropy of predictions.
+      - External reward can be added.
+    """
+    novelty = tf.math.reduce_std(hidden)
+    entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
+    avg_uncertainty = tf.reduce_mean(entropy)
+    loss_signal = tf.sigmoid(-loss)
+    novelty_signal = 0.5 * tf.sigmoid(novelty)
+    uncertainty_signal = 0.5 * tf.sigmoid(avg_uncertainty)
+    combined_reward = loss_signal + novelty_signal + uncertainty_signal + external_reward
+    return combined_reward    
+
+# -----------------------------------------------------------------------------
+# 8. Data loading functions.
 # -----------------------------------------------------------------------------
 def get_real_data(num_samples):
     # Example: load a dataset (ensure the CSV exists at the specified path)
@@ -231,156 +443,7 @@ def create_tf_dataset(inputs, labels, batch_size=128, shuffle=False, repeat_epoc
         dataset = dataset.shuffle(buffer_size=1000)
     dataset = dataset.repeat(repeat_epochs).batch(batch_size).prefetch(tf.data.AUTOTUNE)
     return dataset
-
-# -----------------------------------------------------------------------------
-# 6. Reinforcement Signals Beyond Loss.
-# -----------------------------------------------------------------------------
-def compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0):
-    """
-    Combines multiple signals into a reinforcement reward.
-      - Loss-based signal: tf.sigmoid(-loss)
-      - Novelty signal: standard deviation of hidden activations.
-      - Uncertainty signal: average entropy of predictions.
-      - External reward can be added.
-    """
-    novelty = tf.math.reduce_std(hidden)
-    entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
-    avg_uncertainty = tf.reduce_mean(entropy)
-    loss_signal = tf.sigmoid(-loss)
-    novelty_signal = 0.5 * tf.sigmoid(novelty)
-    uncertainty_signal = 0.5 * tf.sigmoid(avg_uncertainty)
-    combined_reward = loss_signal + novelty_signal + uncertainty_signal + external_reward
-    return combined_reward
-
-# -----------------------------------------------------------------------------
-# 7. MetaPlasticityController: Nested meta-controller for hyperparameter tuning.
-# -----------------------------------------------------------------------------
-class MetaPlasticityController(tf.keras.layers.Layer):
-    def __init__(self, hidden_units=16, **kwargs):
-        super(MetaPlasticityController, self).__init__(**kwargs)
-        self.dense1 = tf.keras.layers.Dense(hidden_units, activation='relu')
-        self.dense2 = tf.keras.layers.Dense(hidden_units, activation='relu')
-        # Output adjustments for [plasticity_multiplier_delta, reward_scaling_delta]
-        self.out = tf.keras.layers.Dense(2, activation='tanh')  # tanh to bound adjustments
-
-    def call(self, inputs):
-        # inputs: a vector with [mean_error, std_error, current_multiplier, current_reward_scaling]
-        x = self.dense1(inputs)
-        x = self.dense2(x)
-        adjustments = self.out(x)
-        return adjustments
-
-# -----------------------------------------------------------------------------
-# 8. Training loop with nested meta-plasticity.
-# -----------------------------------------------------------------------------
-def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=1000,
-                homeostasis_interval=100, architecture_update_interval=100,
-                plasticity_start_epoch=3, plasticity_update_interval=10):
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
     
-    # Initialize plasticity weight and reward scaling (now controlled by meta_controller).
-    global_plasticity_weight_multiplier = tf.Variable(0.5, trainable=False, dtype=tf.float32)
-    global_reward_scaling_factor = tf.Variable(0.1, trainable=False, dtype=tf.float32)
-
-    # Define optimal target values for mean and std of plasticity delta.
-    MEAN_MIN, MEAN_MAX = 1e-4, 1e-3
-    STD_MIN, STD_MAX = 5e-4, 1e-2
-    OPTIMAL_MEAN = (MEAN_MIN + MEAN_MAX) / 2
-    OPTIMAL_STD = (STD_MIN + STD_MAX) / 2
-
-    train_loss = tf.keras.metrics.Mean(name='train_loss')
-    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-    
-    global_step = 0
-    for epoch in range(num_epochs):
-        plasticity_weight = ((epoch - plasticity_start_epoch + 1) / 
-                             (num_epochs - plasticity_start_epoch + 1)) if epoch >= plasticity_start_epoch else 0.0
-        plasticity_weight *= global_plasticity_weight_multiplier.numpy()  # use current multiplier
-
-        for images, labels in ds_train:
-            with tf.GradientTape() as tape:
-                predictions, hidden = model(images, training=True)
-                loss = loss_fn(labels, predictions)
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            
-            train_loss(loss)
-            train_accuracy(labels, predictions)
-            
-            x_flat = model.flatten(images)
-            pre_activity = tf.reduce_mean(x_flat, axis=0)
-            post_activity = tf.reduce_mean(hidden, axis=0)
-            
-            # Compute combined reward.
-            reward = global_reward_scaling_factor.numpy() * compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0)
-            
-            if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
-                plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
-                plasticity_delta *= plasticity_weight
-                model.hidden.apply_plasticity(plasticity_delta)
-                
-                # Compute mean and std of plasticity updates.
-                delta_mean = tf.reduce_mean(tf.abs(plasticity_delta))
-                delta_std = tf.math.reduce_std(plasticity_delta)
-
-                # Calculate errors with respect to optimal values.
-                mean_error = delta_mean - OPTIMAL_MEAN
-                std_error = delta_std - OPTIMAL_STD
-
-                # Use the meta controller to get adjustments.
-                meta_input = tf.convert_to_tensor([[mean_error, std_error,
-                                                     global_plasticity_weight_multiplier.numpy(),
-                                                     global_reward_scaling_factor.numpy()]], dtype=tf.float32)
-                adjustments = meta_controller(meta_input)
-                # adjustments are in [-1,1]; we scale them to a small update
-                adjust_factor = 0.05
-                new_multiplier = global_plasticity_weight_multiplier * (1.0 + adjust_factor * adjustments[0, 0])
-                new_reward_scaling = global_reward_scaling_factor * (1.0 + adjust_factor * adjustments[0, 1])
-                
-                # Clamp the values to reasonable ranges.
-                new_multiplier = tf.clip_by_value(new_multiplier, 0.01, 5.0)
-                new_reward_scaling = tf.clip_by_value(new_reward_scaling, 0.01, 5.0)
-                
-                global_plasticity_weight_multiplier.assign(new_multiplier)
-                global_reward_scaling_factor.assign(new_reward_scaling)
-            
-            if global_step % homeostasis_interval == 0:
-                model.hidden.apply_homeostatic_scaling()
-                model.hidden.apply_structural_plasticity()
-            
-            if global_step % architecture_update_interval == 0:
-                model.hidden.apply_architecture_modification()
-            
-            global_step += 1
-        
-        print(f"\nEpoch {epoch+1}/{num_epochs}\nTrain Loss: {train_loss.result():.4f}, "
-              f"Train Accuracy: {train_accuracy.result():.4f}, Plasticity Weight: {plasticity_weight:.6f}")
-        train_loss.reset_state()
-        train_accuracy.reset_state()
-        
-        # Validation Evaluation.
-        val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
-        val_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
-        for images, labels in ds_val:
-            predictions, _ = model(images, training=False)
-            loss_val = loss_fn(labels, predictions)
-            val_loss_metric(loss_val)
-            val_accuracy_metric(labels, predictions)
-        print(f"Val Loss: {val_loss_metric.result():.4f}, Val Accuracy: {val_accuracy_metric.result():.4f}")
-        
-        # Test Evaluation.
-        test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
-        test_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
-        for images, labels in ds_test:
-            predictions, _ = model(images, training=False)
-            loss_test = loss_fn(labels, predictions)
-            test_loss_metric(loss_test)
-            test_accuracy_metric(labels, predictions)
-        print(f"Test Loss: {test_loss_metric.result():.4f}, Test Accuracy: {test_accuracy_metric.result():.4f}")
-    
-    model.save("models/MetaSynapse_vNested.keras")
-
 # -----------------------------------------------------------------------------
 # 9. Main: Create dataset, instantiate models, and train.
 # -----------------------------------------------------------------------------
@@ -389,7 +452,7 @@ def main():
     max_units = 512
     initial_units = 16
     # Load sequence data.
-    sequence = get_real_data(num_samples=100_000)
+    sequence = get_real_data(num_samples=10_000)
     inputs, labels = create_windows(sequence, window_size=65)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
     
