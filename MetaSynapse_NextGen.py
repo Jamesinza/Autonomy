@@ -155,15 +155,6 @@ class DynamicConnectivity(tf.keras.layers.Layer):
 class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
     def __init__(self, max_units, initial_units, plasticity_controller, 
                  decay_factor=0.9, prune_activation_threshold=0.01, growth_activation_threshold=0.8, **kwargs):
-        """
-        max_units: total candidate neurons.
-        initial_units: neurons active at initialization.
-        plasticity_controller: instance of RecurrentPlasticityController.
-        decay_factor: for homeostatic scaling.
-        prune_activation_threshold: activation below which an active neuron is pruned.
-        growth_activation_threshold: if the mean activation of active neurons exceeds this,
-                                     then an inactive neuron is activated (growth).
-        """
         super(DynamicPlasticDenseAdvancedHyperV2, self).__init__(**kwargs)
         self.max_units = max_units
         self.initial_units = initial_units
@@ -172,18 +163,22 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.prune_activation_threshold = prune_activation_threshold
         self.growth_activation_threshold = growth_activation_threshold
         self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)
-        # Plasticity & Homeostasis parameters.
+        
+        # Plasticity & Homeostasis parameters for weights.
         self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)
         self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-        self.target_avg = tf.Variable(0.2, trainable=False, dtype=tf.float32)        
+        self.target_avg = tf.Variable(0.2, trainable=False, dtype=tf.float32)
+        # Homeostasis parameters for delays.
+        self.avg_delay_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        self.target_delay = tf.Variable(0.2, trainable=False, dtype=tf.float32)
+        
         # Create a mask for active neurons.
-        init_mask = [1] * self.initial_units + [0] * (self.max_units - self.initial_units)
-        self.neuron_mask = tf.Variable(self.init_mask, trainable=False, dtype=tf.float32)
+        init_mask = [1] * initial_units + [0] * (max_units - initial_units)
+        self.neuron_mask = tf.Variable(init_mask, trainable=False, dtype=tf.float32)
         # Running average activation (per neuron)
-        self.neuron_activation_avg = tf.Variable(tf.zeros([self.max_units], dtype=tf.float32),
-                                                 trainable=False)
+        self.neuron_activation_avg = tf.Variable(tf.zeros([max_units], dtype=tf.float32), trainable=False)
         # Buffer for accumulating feature vectors for meta-updates.
         self.feature_history = []
 
@@ -195,14 +190,24 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.b = self.add_weight(shape=(self.max_units,),
                                  initializer='zeros',
                                  trainable=True, name='bias')
+        # New: learnable delay for each connection.
+        self.delay = self.add_weight(shape=(input_dim, self.max_units),
+                                     initializer=tf.keras.initializers.Zeros(),
+                                     trainable=True, name='delay')
         super(DynamicPlasticDenseAdvancedHyperV2, self).build(input_shape)
+
     @tf.function
     def call(self, inputs):
-        z = tf.matmul(inputs, self.w) + self.b  # (batch, max_units)
+        # Compute a delay-modulated weight matrix.
+        # Here, we “simulate” the effect of delay by modulating the connection strength.
+        w_mod = self.w * tf.math.sigmoid(self.delay)
+        z = tf.matmul(inputs, w_mod) + self.b  # (batch, max_units)
+        
         connectivity = self.dynamic_connectivity(tf.expand_dims(self.neuron_activation_avg, axis=0))
         mask = tf.expand_dims(self.neuron_mask, axis=0)
         z_mod = z * connectivity * mask
-        a = tf.keras.activations.get('relu')(z_mod)
+        a = tf.keras.activations.relu(z_mod)
+        
         # Update running average activation.
         batch_mean = tf.reduce_mean(a, axis=0)
         alpha = 0.9
@@ -212,39 +217,50 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
 
     def plasticity_update(self, pre_activity, post_activity, reward):
         """
-        Compute plasticity update for self.w using the recurrent controller with temporal context.
-        Accumulates a history of feature vectors and uses a GRU once the buffer is full.
+        Compute plasticity updates for both weights and delays.
+        Here we use the same feature vector (omitting delay for simplicity)
+        and compute two separate deltas.
         """
         pre_mean = tf.reduce_mean(pre_activity)
         post_mean = tf.reduce_mean(post_activity)
         weight_mean = tf.reduce_mean(self.w)
         reward_feature = tf.cast(reward, tf.float32)
-        # Form the current feature vector.
         current_feature = tf.stack([pre_mean, post_mean, weight_mean, reward_feature])
         self.feature_history.append(current_feature)
-        # Only compute an update if the history is long enough.
         if len(self.feature_history) < self.plasticity_controller.sequence_length:
-            return tf.zeros_like(self.w)
-        # Build the sequence tensor: shape (1, sequence_length, feature_dim)
+            return tf.zeros_like(self.w), tf.zeros_like(self.delay)
         recent_features = self.feature_history[-self.plasticity_controller.sequence_length:]
         feature_sequence = tf.stack(recent_features, axis=0)
         feature_sequence = tf.expand_dims(feature_sequence, axis=0)
         adjustments = self.plasticity_controller(feature_sequence)  # (1, 2)
         delta_add, delta_mult = adjustments[0, 0], adjustments[0, 1]
-        plasticity_delta = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.w)
-        return plasticity_delta
+        plasticity_delta_w = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.w)
+        plasticity_delta_delay = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.delay)
+        return plasticity_delta_w, plasticity_delta_delay
 
-    def apply_plasticity(self, plasticity_delta):
-        self.w.assign_add(plasticity_delta)
+    def apply_plasticity(self, plasticity_delta_w, plasticity_delta_delay):
+        self.w.assign_add(plasticity_delta_w)
+        self.delay.assign_add(plasticity_delta_delay)
+
     @tf.function
     def apply_homeostatic_scaling(self):
+        # Scaling for weights.
         avg_w = tf.reduce_mean(tf.abs(self.w))
         new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
         scaling_factor = new_target / (avg_w + 1e-6)
         self.w.assign(self.w * scaling_factor)
         self.avg_weight_magnitude.assign(avg_w)
+        
+        # Scaling for delays.
+        avg_delay = tf.reduce_mean(tf.abs(self.delay))
+        new_target_delay = self.decay_factor * self.target_delay + (1 - self.decay_factor) * avg_delay
+        scaling_factor_delay = new_target_delay / (avg_delay + 1e-6)
+        self.delay.assign(self.delay * scaling_factor_delay)
+        self.avg_delay_magnitude.assign(avg_delay)
+
     @tf.function
     def apply_structural_plasticity(self):
+        # Structural plasticity for weights.
         pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
         self.w.assign(pruned_w)
         random_matrix = tf.random.uniform(tf.shape(self.w))
@@ -256,21 +272,34 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.sparsity.assign(tf.reduce_mean(tf.cast(tf.equal(self.w, 0.0), tf.float32)))
         self.adjust_prune_threshold()
         self.adjust_add_prob()
+        
+        # Structural plasticity for delays.
+        pruned_delay = tf.where(tf.abs(self.delay) < self.prune_threshold, tf.zeros_like(self.delay), self.delay)
+        self.delay.assign(pruned_delay)
+        random_matrix_delay = tf.random.uniform(tf.shape(self.delay))
+        add_mask_delay = tf.cast(random_matrix_delay < self.add_prob, tf.float32)
+        new_delays = tf.where(tf.logical_and(tf.equal(self.delay, 0.0), tf.equal(add_mask_delay, 1.0)),
+                               tf.random.uniform(tf.shape(self.delay), minval=0.01, maxval=0.05),
+                               self.delay)
+        self.delay.assign(new_delays)
+
     @tf.function
     def adjust_prune_threshold(self):
         if self.sparsity > 0.8:
             self.prune_threshold.assign(self.prune_threshold * 1.05)
         elif self.sparsity < 0.3:
             self.prune_threshold.assign(self.prune_threshold * 0.95)
+
     @tf.function
     def adjust_add_prob(self):
         if self.avg_weight_magnitude < 0.01:
             self.add_prob.assign(self.add_prob * 1.05)
         elif self.avg_weight_magnitude > 0.1:
             self.add_prob.assign(self.add_prob * 0.95)
+
     @tf.function
     def apply_architecture_modification(self):
-        # Prune: For active neurons, set mask to 0 if their running average activation is below threshold.
+        # Prune active neurons with low running average activation.
         mask_after_prune = tf.where(
             tf.logical_and(
                 tf.equal(self.neuron_mask, 1.0),
@@ -279,41 +308,31 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
             tf.zeros_like(self.neuron_mask),
             self.neuron_mask
         )
-        # Extract activations of the currently active neurons.
         active_values = tf.boolean_mask(self.neuron_activation_avg, tf.equal(mask_after_prune, 1.0))
-        # Determine if the growth condition is met:
-        # There must be at least one active neuron and their mean activation exceeds the growth threshold.
         growth_cond = tf.cond(
             tf.greater(tf.size(active_values), 0),
             lambda: tf.greater(tf.reduce_mean(active_values), self.growth_activation_threshold),
             lambda: tf.constant(False)
         )
         def grow_neuron():
-            # Find indices of inactive neurons.
             inactive_indices = tf.squeeze(tf.where(tf.equal(mask_after_prune, 0.0)), axis=1)
-            # If there is at least one inactive neuron, activate one at random.
             def activate_random():
-                # Shuffle inactive indices and pick the first.
                 random_idx = tf.random.shuffle(inactive_indices)[0]
-                # Update the mask: set the chosen index to 1.
                 new_mask = tf.tensor_scatter_nd_update(
                     mask_after_prune,
                     indices=tf.reshape(random_idx, (-1, 1)),
                     updates=[1.0]
                 )
                 return new_mask
-            # If no inactive neuron is available, return the mask unchanged.
             new_mask = tf.cond(
                 tf.greater(tf.shape(inactive_indices)[0], 0),
                 activate_random,
                 lambda: mask_after_prune
             )
             return new_mask
-        # If growth condition is met, update the mask by growing one neuron.
-        # Otherwise, keep the pruned mask.
         new_mask = tf.cond(growth_cond, grow_neuron, lambda: mask_after_prune)
-        # Assign the updated mask back to the variable.
         self.neuron_mask.assign(new_mask)
+
                 
 # --- Mixture-of-Experts Dynamic Plastic Layer ---
 class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
@@ -531,11 +550,12 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                     base_neuromod_signal = compute_neuromodulatory_signal(predictions, expert_reward)
                     latent_signal = tf.reduce_mean(compute_latent_mod(latent))
                     neuromod_signal = base_neuromod_signal * latent_signal
-                    plasticity_delta = expert.plasticity_update(pre_activity, post_activity, expert_reward)
-                    if tf.reduce_sum(tf.abs(plasticity_delta)) > 0:
-                        plasticity_delta *= plasticity_weight * neuromod_signal
-                        plasticity_delta = tf.clip_by_norm(plasticity_delta, clip_norm=0.05)
-                        expert.apply_plasticity(plasticity_delta)
+                    plasticity_delta_w, plasticity_delta_delay = expert.plasticity_update(pre_activity, post_activity, expert_reward)
+                    if tf.reduce_sum(tf.abs(plasticity_delta_w)) > 0:
+                        plasticity_delta_w *= plasticity_weight * neuromod_signal
+                        plasticity_delta_w = tf.clip_by_norm(plasticity_delta_w, clip_norm=0.05)
+                        plasticity_delta_delay = tf.clip_by_norm(plasticity_delta_delay, clip_norm=0.05)
+                        expert.apply_plasticity(plasticity_delta_w, plasticity_delta_delay)
             
             if global_step % homeostasis_interval == 0:
                 for expert in model.hidden.experts:
@@ -725,14 +745,14 @@ def main():
     initial_units = 64
     cnn_units = 128
     epochs = 1000
-    experts = 8
+    experts = 32
     h = 16
     w = 16
     window_size = h*w
     learning_rate=1e-3
     
     # Load data.
-    sequence = get_real_data(num_samples=100_000)
+    sequence = get_real_data(num_samples=5_000)
     inputs, labels = create_windows(sequence, window_size=window_size+1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
     
