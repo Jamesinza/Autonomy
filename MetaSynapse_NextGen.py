@@ -75,35 +75,53 @@ class RecurrentPlasticityController(tf.keras.layers.Layer):
 # =============================================================================
 # 3. Unsupervised Feature Extractor: A simple auto-encoder for latent representations.
 # =============================================================================
+import tensorflow as tf
+
 class UnsupervisedFeatureExtractor(tf.keras.Model):
-    def __init__(self, h, w, latent_dim=16, **kwargs):
-        super(UnsupervisedFeatureExtractor, self).__init__(**kwargs)
-        self.flat = tf.keras.layers.Flatten() 
-        # Encoder: a few Dense layers.
-        self.encoder = tf.keras.Sequential([
-            #tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(latent_dim*16, activation='relu'),
-            tf.keras.layers.Dense(latent_dim*8, activation='relu'),
-            tf.keras.layers.Dense(latent_dim*4, activation='relu'),
-            tf.keras.layers.Dense(latent_dim, activation='relu')
-        ])
-        # Decoder: mirror of encoder.
-        self.decoder = tf.keras.Sequential([
-            tf.keras.layers.Dense(latent_dim*4, activation='relu'),
-            tf.keras.layers.Dense(latent_dim*8, activation='relu'),
-            tf.keras.layers.Dense(latent_dim*16, activation='relu'),
-            tf.keras.layers.Dense(1, activation='sigmoid'),
-            #tf.keras.layers.Reshape((h, w, 1))
-        ])
-    @tf.function    
-    def call(self, x):
-        latent = self.encoder(x)
-        flat_latent = self.flat(latent)
-        reconstruction = self.decoder(latent)
+    def __init__(self, units=128, **kwargs):
+        super().__init__(**kwargs)
+        """
+        Autoencoder based on the U-Net architecture.
+        """
+        self.units = units
+
+        # Encoder layers
+        self.enc_cnn1 = tf.keras.layers.Conv2D(units, (3, 3), activation="relu", padding="same", name="enc_cnn1")
+        self.enc_pool1 = tf.keras.layers.MaxPooling2D((2, 2), padding="same", name="enc_pool1")
+        self.enc_cnn2 = tf.keras.layers.Conv2D(units * 2, (3, 3), activation="relu", padding="same", name="enc_cnn2")
+        self.enc_pool2 = tf.keras.layers.MaxPooling2D((2, 2), padding="same", name="enc_pool2")
+        self.enc_latent = tf.keras.layers.Conv2D(units * 4, (3, 3), activation="relu", padding="same", name="enc_latent")
+        self.global_avg_pool = tf.keras.layers.GlobalAveragePooling2D(name="global_avg_pool")
+
+        # Decoder layers
+        self.dec_upconv1 = tf.keras.layers.Conv2DTranspose(units * 2, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv1")
+        self.dec_concat1 = tf.keras.layers.Concatenate(name="dec_concat1")
+        self.dec_upconv2 = tf.keras.layers.Conv2DTranspose(units, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv2")
+        self.dec_output = tf.keras.layers.Conv2D(1, (3, 3), activation="sigmoid", padding="same", name="dec_output")
+
+    def encode(self, x):
+        x = self.enc_cnn1(x)
+        x = self.enc_pool1(x)
+        x1 = self.enc_cnn2(x)
+        x = self.enc_pool2(x1)
+        latent = self.enc_latent(x)
+        flat_latent = self.global_avg_pool(latent)
+        return x1, latent, flat_latent
+
+    def decode(self, x1, latent):
+        y1 = self.dec_upconv1(latent)
+        y1 = self.dec_concat1([x1, y1])
+        y = self.dec_upconv2(y1)
+        return self.dec_output(y)
+
+    @tf.function
+    def call(self, inputs):
+        x1, latent, flat_latent = self.encode(inputs)
+        reconstruction = self.decode(x1, latent)
         return flat_latent, reconstruction
-        
+
     def compute_output_shape(self, input_shape):
-        return input_shape        
+        return input_shape
 
 # =============================================================================
 # 4. Dynamic Connectivity: Using learned activation and unsupervised latent cues.
@@ -153,18 +171,15 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.prune_activation_threshold = prune_activation_threshold
         self.growth_activation_threshold = growth_activation_threshold
         self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)
-
         # Plasticity & Homeostasis parameters.
         self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)
         self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
         self.target_avg = tf.Variable(0.2, trainable=False, dtype=tf.float32)        
-        
         # Create a mask for active neurons.
         init_mask = [1] * initial_units + [0] * (max_units - initial_units)
         self.neuron_mask = tf.Variable(init_mask, trainable=False, dtype=tf.float32)
-        
         # Running average activation (per neuron)
         self.neuron_activation_avg = tf.Variable(tf.zeros([max_units], dtype=tf.float32),
                                                  trainable=False)
@@ -187,7 +202,6 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         mask = tf.expand_dims(self.neuron_mask, axis=0)
         z_mod = z * connectivity * mask
         a = tf.keras.activations.get('relu')(z_mod)
-        
         # Update running average activation.
         batch_mean = tf.reduce_mean(a, axis=0)
         alpha = 0.9
@@ -204,20 +218,16 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         post_mean = tf.reduce_mean(post_activity)
         weight_mean = tf.reduce_mean(self.w)
         reward_feature = tf.cast(reward, tf.float32)
-        
         # Form the current feature vector.
         current_feature = tf.stack([pre_mean, post_mean, weight_mean, reward_feature])
         self.feature_history.append(current_feature)
-        
         # Only compute an update if the history is long enough.
         if len(self.feature_history) < self.plasticity_controller.sequence_length:
             return tf.zeros_like(self.w)
-        
         # Build the sequence tensor: shape (1, sequence_length, feature_dim)
         recent_features = self.feature_history[-self.plasticity_controller.sequence_length:]
         feature_sequence = tf.stack(recent_features, axis=0)
         feature_sequence = tf.expand_dims(feature_sequence, axis=0)
-        
         adjustments = self.plasticity_controller(feature_sequence)  # (1, 2)
         delta_add, delta_mult = adjustments[0, 0], adjustments[0, 1]
         plasticity_delta = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.w)
@@ -372,12 +382,10 @@ class EpisodicMemory(tf.keras.layers.Layer):
         attention = self.read_layer(inputs)  # Expected shape: (batch, memory_size)
         read_vector = tf.matmul(tf.expand_dims(attention, 1), self.memory)
         read_vector = tf.squeeze(read_vector, axis=1)  # Now shape: (batch, memory_dim)
-        
         # Write: Compute write vectors from the inputs.
         write_vector = self.write_layer(inputs)  # Shape: (batch, memory_dim)
         # Aggregate the batch into one vector.
         aggregated_write_vector = tf.reduce_mean(write_vector, axis=0)  # Shape: (memory_dim,)
-        
         # Update a random memory slot with the aggregated write vector.
         idx = tf.random.uniform(shape=[], maxval=self.memory_size, dtype=tf.int32)
         memory_update = tf.tensor_scatter_nd_update(self.memory, [[idx]], [aggregated_write_vector])
@@ -388,11 +396,12 @@ class EpisodicMemory(tf.keras.layers.Layer):
 # 7. Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer.
 # =============================================================================
 class PlasticityModelMoE(tf.keras.Model):
-    def __init__(self, h, w, plasticity_controller, num_experts=2, max_units=128, 
+    def __init__(self, h, w, plasticity_controller, units=128 num_experts=2, max_units=128, 
                  initial_units=32, num_classes=10, memory_size=512, memory_dim=32, **kwargs):
         super(PlasticityModelMoE, self).__init__(**kwargs)
-        self.unsupervised_extractor = UnsupervisedFeatureExtractor(h, w)
-        self.flatten = tf.keras.layers.Flatten()
+        self.cnn = tf.keras.layers.Conv2D(units, (3,3), activation='relu', padding='same')
+        self.unsupervised_extractor = UnsupervisedFeatureExtractor()
+        self.flatten = tf.keras.layers.GlobalAveragePooling2D()
         self.episodic_memory = EpisodicMemory(memory_size, memory_dim)
         self.hidden = MoE_DynamicPlasticLayer(num_experts, max_units, initial_units, plasticity_controller)
         self.feature_combiner = tf.keras.layers.Dense(128, activation='relu')
@@ -403,7 +412,8 @@ class PlasticityModelMoE(tf.keras.Model):
     def call(self, x, training=False):
         latent, reconstruction = self.unsupervised_extractor(x)
         memory_read = self.episodic_memory(latent)
-        x_flat = self.flatten(x)
+        cnn = self.cnn(x)
+        x_flat = self.flatten(cnn)
         combined_input = tf.concat([x_flat, latent, memory_read], axis=-1)
         hidden_act = self.hidden(combined_input)
         combined = tf.concat([hidden_act, latent, memory_read], axis=-1)
@@ -420,7 +430,7 @@ class PlasticityModelMoE(tf.keras.Model):
 def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=1000,
                 homeostasis_interval=13, architecture_update_interval=21,
                 plasticity_update_interval=8, plasticity_start_epoch=3,
-                early_stop_patience=100, early_stop_min_delta=1e-4, learning_rate=1e-3, **kwargs):
+                early_stop_patience=10, early_stop_min_delta=1e-4, learning_rate=1e-3, **kwargs):
                 
     optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
     ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
@@ -471,7 +481,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
         # -----------------------
         for step in range(train_steps):
             images, labels = next(train_iter)        
-            with tf.GradientTape(persistent=True) as tape:
+            with tf.GradientTape(persistent=False) as tape:
                 predictions, hidden, reconstruction, uncertainty, latent = model(images, training=True)
                 # hidden, reconstruction = model.unsupervised_extractor(images, training=True)
                 
@@ -489,8 +499,8 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
             grads = tape.gradient(total_loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
             
-            ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
-            ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))
+            # ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
+            # ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))
             
             batch_errors.append(loss.numpy())
             train_loss_metric(loss)
@@ -602,10 +612,9 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                 if best_weights is not None:
                     print("Restoring best weights and saving model.\n")
                     model.set_weights(best_weights)
-                    model.save("models/MetaSynapse_NextGen_v5.keras")
-                    model.unsupervised_extractor.save("models/unsupervised_extractor_v5.keras")
-                    patience_counter = 0
-                #break  # Exit the epoch loop.
+                    model.save("models/MetaSynapse_NextGen_v5b.keras")
+                    model.unsupervised_extractor.save("models/unsupervised_extractor_v5b.keras")
+                break  # Exit the epoch loop.
 
 # =============================================================================
 # 9. Helper functions for various signals.
@@ -703,17 +712,17 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # =============================================================================
 def main():
     batch_size = 128
-    max_units = 64
-    initial_units = 16
+    max_units = 256
+    initial_units = 64
     epochs = 1000
-    experts = 8
+    experts = 32
     h = 16
     w = 16
     window_size = h*w
-    learning_rate=1e-4
+    learning_rate=1e-5
     
     # Load data.
-    sequence = get_real_data(num_samples=1_000)
+    sequence = get_real_data(num_samples=5_000)
     inputs, labels = create_windows(sequence, window_size=window_size+1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
     
@@ -736,17 +745,16 @@ def main():
     # Instantiate the new MoE-based model.
     model = PlasticityModelMoE(h, w, plasticity_controller, num_experts=experts, max_units=max_units, initial_units=initial_units, num_classes=10)
     ae_model = model.unsupervised_extractor
-    # latent_mod = model.latent_modulator
     dummy_input = tf.zeros((1, h, w, 1))
     _ = model(dummy_input, training=False)
     _ = ae_model(dummy_input, training=False)
-    # _ = latent_mod(dummy_input, training=False)
     model.summary()
+    model.load_weights('model_weights/MetaSynapse_NextGen_v5b/model.weights.h5')
         
     # Train the model.
     train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=epochs,
-                homeostasis_interval=8, architecture_update_interval=21,
-                plasticity_update_interval=5, plasticity_start_epoch=3, learning_rate=learning_rate)
+                homeostasis_interval=13, architecture_update_interval=55,
+                plasticity_update_interval=8, plasticity_start_epoch=3, learning_rate=learning_rate)
     
 if __name__ == '__main__':
     main()
