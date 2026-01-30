@@ -299,13 +299,13 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         # Update experts' weights vectorized.
         new_expert_ws = expert_ws + delta_ws  # * neuromod_signal
         new_expert_delays = expert_delays + delta_delays  # * neuromod_signal
-        del delta_ws, delta_delays, expert_ws, expert_delays
+        # del delta_ws, delta_delays, expert_ws, expert_delays
         new_ws_list = tf.unstack(new_expert_ws, axis=0)
         new_delays_list = tf.unstack(new_expert_delays, axis=0)
         for i, expert in enumerate(self.experts):
             expert.w.assign(new_ws_list[i])
             expert.delay.assign(new_delays_list[i])
-        # return delta_ws, delta_delays
+        return delta_ws, delta_delays
 
 # ===========================
 # Meta-Plasticity Controller
@@ -836,8 +836,9 @@ def scheduled_plasticity_updates(model, global_plasticity_weight_multiplier, glo
     del plasticity_features
     gate_modulation = tf.reduce_mean(gating_signal)
     # Apply the batched plasticity update across all experts.
-    model.hidden.batch_plasticity_update(pre_activity, post_activity, reward, neuromod_signal,
+    delta_ws, delta_delays = model.hidden.batch_plasticity_update(pre_activity, post_activity, reward, neuromod_signal,
                                          scale_factor, bias_adjustment, update_gate, gate_modulation)
+    return delta_ws, delta_delays
 
 # @tf.function
 def compute_neuromodulatory_signal(predictions, external_reward=0.0):
@@ -870,18 +871,64 @@ def critic_alignment_loss(episodic_memory, current_predictions):
     loss = tf.reduce_mean(1.0 - cosine_sim)
     return loss
 
+def compute_avg_homeo_deviation(model):
+    """
+    Computes the average absolute deviation of the neuron activation averages
+    from the target average across all experts.
+    """
+    deviations = []
+    # Iterate over each expert (DynamicPlasticDenseDendritic layer) in the MoE.
+    for expert in model.hidden.experts:
+        # Compute the per-neuron absolute difference.
+        diff = tf.abs(expert.neuron_activation_avg - expert.target_avg)
+        # Average over all neurons.
+        deviation = tf.reduce_mean(diff)
+        deviations.append(deviation)
+    # Return the average deviation over all experts.
+    return tf.reduce_mean(deviations)
+
+def compute_avg_arch_change(model):
+    """
+    Computes the average change in the neuron masks across all experts.
+    This function stores the previous mask for each expert to compute the difference
+    with the current mask.
+    """
+    # Initialize the storage for previous masks if it doesn't exist.
+    if not hasattr(compute_avg_arch_change, "prev_masks"):
+        compute_avg_arch_change.prev_masks = {}
+    
+    diffs = []
+    # Iterate over each expert in the MoE.
+    for i, expert in enumerate(model.hidden.experts):
+        current_mask = tf.cast(expert.neuron_mask, tf.float32)
+        # If no previous mask is stored, initialize it with the current mask.
+        if i not in compute_avg_arch_change.prev_masks:
+            compute_avg_arch_change.prev_masks[i] = current_mask
+            diff = tf.constant(0.0, dtype=tf.float32)
+        else:
+            prev_mask = compute_avg_arch_change.prev_masks[i]
+            # Compute the average absolute difference.
+            diff = tf.reduce_mean(tf.abs(current_mask - prev_mask))
+            # Update stored mask for next epoch comparison.
+            compute_avg_arch_change.prev_masks[i] = current_mask
+        diffs.append(diff)
+    # Return the average change across all experts.
+    return tf.reduce_mean(diffs)
+    
+    
+
 # ===================
 # Main Training Loop
 # ===================
 def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
                 num_epochs=1000, homeostasis_interval=10, architecture_update_interval=2,
                 plasticity_update_interval=10, plasticity_start_epoch=1,
-                early_stop_patience=100, early_stop_min_delta=1e-4, learning_rate=1e-3,
-                critic_loss_weight=0.1):
+                early_stop_patience=100, early_stop_min_delta=1e-4, initial_lr=1e-3,
+                min_lr=1e-6, lr_decay_factor=0.5, lr_patience=5, critic_loss_weight=0.1):
     # Set up optimizers.
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
-    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
-    critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr)
+    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr)
+    critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr)
 
     # Set up loss functions
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
@@ -910,6 +957,33 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     recon_patience_counter = 10
     best_weights = None
     recon_best_weights = None
+
+    # === Adaptive Plasticity Mechanism ===
+    adaptive_plasticity_interval = plasticity_update_interval
+    plasticity_update_norm_sum = 0.0
+    plasticity_update_count = 0
+    plasticity_threshold_low = 0.001
+    plasticity_threshold_high = 0.01
+    min_interval = 1
+    max_interval = 100
+
+    # === Adaptive Homeostasis Mechanism ===
+    adaptive_homeostasis_interval = homeostasis_interval
+    homeo_threshold_low = 0.05
+    homeo_threshold_high = 0.2
+    min_homeo_interval = 1
+    max_homeo_interval = 100
+
+    # === Adaptive Architecture Update Mechanism ===
+    adaptive_architecture_interval = architecture_update_interval
+    arch_threshold_low = 0.01
+    arch_threshold_high = 0.1
+    min_arch_interval = 1
+    max_arch_interval = 100   
+
+    # === Adaptive Learning Rate ===
+    current_lr = initial_lr
+    lr_patience_counter = 0    
 
     for epoch in range(num_epochs):
         start_time = time.time()
@@ -942,21 +1016,57 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
             latent_signal = tf.reduce_mean(compute_latent_mod(latent))
             neuromod_signal = base_neuromod_signal * latent_signal            
             # Apply plasticity updates if scheduled.
-            if plasticity_weight_val > 0 and tf.equal(global_step % plasticity_update_interval, 0):
-                scheduled_plasticity_updates(model, global_plasticity_weight_multiplier,
+            if plasticity_weight_val > 0 and tf.equal(global_step % adaptive_plasticity_interval, 0):
+                delta_ws, delta_delays = scheduled_plasticity_updates(model, global_plasticity_weight_multiplier,
                                              global_reward_scaling_factor, pre_activity,
                                              post_activity, gating_signal, reward, neuromod_signal)
+                delta_norm_ws = tf.norm(delta_ws)
+                delta_norm_delays = tf.norm(delta_delays)
+                total_delta_norm = delta_norm_ws + delta_norm_delays
+                plasticity_update_norm_sum += total_delta_norm.numpy()
+                plasticity_update_count += 1
 
-            if tf.equal(global_step % homeostasis_interval, 0):
+            # Use adaptive homeostasis update interval:
+            if tf.equal(global_step % adaptive_homeostasis_interval, 0):
                 for expert in model.hidden.experts:
                     expert.apply_homeostatic_scaling()
                     expert.apply_structural_plasticity()
-
-            if tf.equal(global_step % architecture_update_interval, 0):
+            
+            # Use adaptive architecture update interval:
+            if tf.equal(global_step % adaptive_architecture_interval, 0):
                 for expert in model.hidden.experts:
                     expert.apply_architecture_modification()
 
             global_step.assign_add(1)
+
+        # --- End-of-Epoch Adjustments ---
+        # Adaptive Plasticity Interval Adjustment
+        if plasticity_update_count > 0:
+            avg_update_norm = plasticity_update_norm_sum / plasticity_update_count
+            if avg_update_norm < plasticity_threshold_low:
+                adaptive_plasticity_interval = max(min_interval, adaptive_plasticity_interval - 1)
+            elif avg_update_norm > plasticity_threshold_high:
+                adaptive_plasticity_interval = min(max_interval, adaptive_plasticity_interval + 1)
+        plasticity_update_norm_sum = 0.0
+        plasticity_update_count = 0
+
+        # Adaptive Homeostasis Interval Adjustment
+        avg_homeo_deviation = compute_avg_homeo_deviation(model)  # Define this based on neuron_activation_avg.
+        if avg_homeo_deviation > homeo_threshold_high:
+            adaptive_homeostasis_interval = max(min_homeo_interval, adaptive_homeostasis_interval - 1)
+        elif avg_homeo_deviation < homeo_threshold_low:
+            adaptive_homeostasis_interval = min(max_homeo_interval, adaptive_homeostasis_interval + 1)
+        
+        # Adaptive Architecture Interval Adjustment
+        avg_arch_change = compute_avg_arch_change(model)  # Define this based on changes in neuron_mask.
+        if avg_arch_change > arch_threshold_high:
+            adaptive_architecture_interval = max(min_arch_interval, adaptive_architecture_interval - 1)
+        elif avg_arch_change < arch_threshold_low:
+            adaptive_architecture_interval = min(max_arch_interval, adaptive_architecture_interval + 1)
+        
+        tf.print(f"\nPlasticity Interval: {adaptive_plasticity_interval}\n"
+                 f"Homeostasis Interval : {adaptive_homeostasis_interval}\n"
+                 f"Architecture Interval :{adaptive_architecture_interval}")
         
         # Epoch logging.
         tf.print(f"\nEpoch {epoch+1}/{num_epochs}\n"
@@ -991,6 +1101,22 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         test_accuracy_metric.reset_state()
         test_recon_loss_metric.reset_state()
 
+        # --- Adaptive Learning Rate ---
+        if current_val_loss < best_val_loss - early_stop_min_delta:
+            best_val_loss = current_val_loss
+            lr_patience_counter = 0
+        else:
+            lr_patience_counter += 1
+            if lr_patience_counter >= lr_patience:
+                new_lr = max(min_lr, current_lr * lr_decay_factor)
+                if new_lr < current_lr:
+                    current_lr = new_lr
+                    optimizer.learning_rate.assign(current_lr)
+                    ae_optimizer.learning_rate.assign(current_lr)
+                    critic_optimizer.learning_rate.assign(current_lr)
+                    tf.print(f"Reduced learning rate to {current_lr:.6e}")
+                lr_patience_counter = 0        
+
         # Early stopping AutoEncoder
         if current_val_recon_loss < best_val_recon_loss - early_stop_min_delta:
             best_val_recon_loss = current_val_recon_loss
@@ -1005,7 +1131,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                 if recon_best_weights is not None:
                     tf.print("Restoring recon best weights and saving model.\n")
                     model.unsupervised_extractor.set_weights(recon_best_weights)
-                    model.unsupervised_extractor.save(f"models/extractors/{model_name}.keras")        
+                    model.unsupervised_extractor.save(f"models/extractors/{model_name}.keras")
 
         # Early Stopping.
         if current_val_loss < best_val_loss - early_stop_min_delta:
@@ -1122,8 +1248,8 @@ def main():
     # model.load_weights("model_weights/MetaSynapse_NextGen_RL_v2/model.weights.h5", skip_mismatch=True)
     model_name = "MetaSynapse_NextGen_RL_v2d"
     train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
-                num_epochs=epochs, homeostasis_interval=13, architecture_update_interval=34,
-                plasticity_update_interval=5, plasticity_start_epoch=10, learning_rate=learning_rate)
+                num_epochs=epochs, homeostasis_interval=1, architecture_update_interval=1,
+                plasticity_update_interval=1, plasticity_start_epoch=1, initial_lr=learning_rate)
     
 if __name__ == '__main__':
     main()
