@@ -12,100 +12,496 @@ import random
 np.random.seed(42)
 tf.random.set_seed(42)
 
-# ============================
-# Metacognitive Critic Module
-# ============================
-class MetacognitiveCritic(tf.keras.layers.Layer):
-    def __init__(self, hidden_units=64, **kwargs):
-        super(MetacognitiveCritic, self).__init__(**kwargs)
-        # A two-layer network to process joint features.
-        self.dense1 = tf.keras.layers.Dense(hidden_units, activation='relu', name='critic_dense1')
-        self.dense2 = tf.keras.layers.Dense(hidden_units, activation='relu', name='critic_dense2')
-        # Output a gating scalar in [0,1] that modulates plasticity updates.
-        self.gating = tf.keras.layers.Dense(1, activation='sigmoid', name='critic_gating')
-        # Additionally, output an alignment score used to compute a self-supervised loss.
-        self.alignment_pred = tf.keras.layers.Dense(1, activation='sigmoid', name='critic_alignment')
-
-    def call(self, episodic_memory, current_predictions):
-        # Assume episodic_memory and current_predictions are tensors of shape (batch, features)
-        joint_input = tf.concat([episodic_memory, current_predictions], axis=-1)
-        x = self.dense1(joint_input)
-        x = self.dense2(x)
-        gating_signal = self.gating(x)            # Shape: (batch, 1)
-        alignment_score = self.alignment_pred(x)    # Shape: (batch, 1)
-        return gating_signal, alignment_score
-        
-# =================================
-# Chaos-inspired Modulation Module
-# =================================
-class ChaoticModulation(tf.keras.layers.Layer):
-    def __init__(self, **kwargs):
-        super(ChaoticModulation, self).__init__(**kwargs)
+# ===================================
+# Celestial Alignment inspired layer
+# ===================================
+class CelestialAlignmentLayer(tf.keras.layers.Layer):
+    def __init__(self, units=256, **kwargs):
+        """
+        Args:
+            units: The dimensionality of the modulation vector (e.g. matching feature size).
+            period: The period of the cyclic signal (e.g. 12 to mimic zodiac cycles).
+        """
+        super(CelestialAlignmentLayer, self).__init__(**kwargs)
+        self.units = units
 
     def build(self, input_shape):
-        # Register r as a trainable scalar parameter.
-        self.r = self.add_weight(
-            shape=(),
-            initializer=tf.keras.initializers.Constant(3.8),
+        # Trainable phase shift and amplitude for each unit.
+        self.phase_shift = self.add_weight(
+            shape=(self.units,),
+            initializer=tf.keras.initializers.Zeros(),
             trainable=True,
-            name='chaotic_r'
+            name="phase_shift")
+        self.amplitude = self.add_weight(
+            shape=(self.units,),
+            initializer=tf.keras.initializers.Ones(),
+            trainable=True,
+            name="amplitude")
+        self.period = self.add_weight(shape=(),
+                                      initializer=tf.keras.initializers.Constant(12.0),
+                                      trainable=True,
+                                      name='period')
+        super(CelestialAlignmentLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        '''
+        inputs: shape (batch, features)
+        Generate a cyclic modulation signal. Instead of relying on tf.timestamp(),
+        which can be unstable in training, we use a continuously updated constant.
+        Here we simulate a time variable using the training step (or a fixed frequency signal).
+        For demonstration, we use a non-trainable sine wave based on a fixed "time" parameter.
+        '''
+        time_scalar = tf.cast(tf.timestamp(), tf.float32)  # Real time in seconds
+        # Create a cyclic signal: sin(2*pi*time/period + phase)
+        cyclic_signal = tf.sin(2 * math.pi * time_scalar / self.period + self.phase_shift)
+        # Scale it with the amplitude.
+        modulation = cyclic_signal * self.amplitude
+        # Expand dims to match inputs and modulate features element-wise.
+        modulation = tf.reshape(modulation, (1, self.units))
+        modulated = inputs * modulation  # Elementwise modulation
+        return modulated
+
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[-1] = self.units
+        return tuple(output_shape)
+
+# ====================== Plasticity Inspired Control Mechanisms Section =======================
+
+# ============================================================================
+# Dynamic Connectivity: Using learned activation and unsupervised latent cues
+# ============================================================================
+class DynamicConnectivity(tf.keras.layers.Layer):
+    def __init__(self, max_units, **kwargs):
+        super(DynamicConnectivity, self).__init__(**kwargs)
+        self.max_units = max_units
+        self.act = LearnedQuantumActivation()
+        self.attention_net = tf.keras.Sequential([
+            tf.keras.layers.Dense(32, activation=self.act, name='dc_dens1'),
+            tf.keras.layers.Dense(self.max_units, activation='sigmoid', name='dc_dens2')
+        ])        
+        
+    def build(self, input_shape):
+        super(DynamicConnectivity, self).build(input_shape)
+    
+    def call(self, neuron_features):
+        connectivity = self.attention_net(neuron_features)
+        return connectivity
+
+# ====================================================
+# Dynamic Plastic Dense Layer with Dendritic Branches
+# ====================================================
+class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
+    def __init__(self, max_units, initial_units, plasticity_controller, num_branches=4, **kwargs):
+        super(DynamicPlasticDenseDendritic, self).__init__(name='DynamicPlasticDenseDendritic', **kwargs)
+        self.max_units = max_units
+        self.initial_units = initial_units
+        self.plasticity_controller = plasticity_controller
+        self.num_branches = num_branches
+        self.act = LearnedQuantumActivation()
+        self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)
+        # Plasticity & homeostasis parameters (non-trainable running stats)
+        self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
+        self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)
+        self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        self.avg_delay_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        # Neuron mask and running average (float32 for stability)
+        init_mask = [1.0] * initial_units + [0.0] * (max_units - initial_units)
+        self.neuron_mask = tf.Variable(init_mask, trainable=False, dtype=tf.float32)
+        self.neuron_activation_avg = tf.Variable(tf.zeros([max_units], dtype=tf.float32), trainable=False)
+        # Circular buffer for meta-plasticity features has been removed for full vectorization.
+        # Gating mechanism to combine dendritic branch outputs.
+        self.branch_gating = tf.keras.layers.Dense(self.num_branches, activation='softmax', name="branch_gating")
+
+    def build(self, input_shape):
+        input_dim = int(input_shape[-1])
+        # Weight: shape (input_dim, max_units, num_branches)
+        self.w = self.add_weight(
+            shape=(input_dim, self.max_units, self.num_branches),
+            initializer=tf.keras.initializers.GlorotUniform(),
+            trainable=True, name='dpd_kernel')
+        # Bias: shape (max_units, num_branches)
+        self.b = self.add_weight(
+            shape=(self.max_units, self.num_branches),
+            initializer=tf.keras.initializers.Zeros(),
+            trainable=True, name='dpd_bias')
+        # Delay for each branch.
+        self.delay = self.add_weight(
+            shape=(input_dim, self.max_units, self.num_branches),
+            initializer=tf.keras.initializers.Zeros(),
+            trainable=True, name='delay')
+        # Make the hard-coded hyperparameters trainable now.
+        self.decay_factor = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.9),
+            trainable=True, name="decay_factor")
+        self.prune_activation_threshold = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.01),
+            trainable=True, name="prune_activation_threshold")
+        self.growth_activation_threshold = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.8),
+            trainable=True, name="growth_activation_threshold")
+        self.target_avg = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.2),
+            trainable=True, name="target_avg")
+        self.target_delay = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.2),
+            trainable=True, name="target_delay")
+        self.alpha = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.9),
+            trainable=True, name="alpha")
+        self.prune_min = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(1.05),
+            trainable=True, name="prune_min")
+        self.prune_max = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.95),
+            trainable=True, name="prune_max")
+        self.prob_min = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(1.05),
+            trainable=True, name="prob_min")
+        self.prob_max = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.95),
+            trainable=True, name="prob_max")
+        super(DynamicPlasticDenseDendritic, self).build(input_shape)
+
+    def call(self, inputs):
+        # Compute branch outputs.
+        w_mod = self.w * tf.math.sigmoid(self.delay)  # (input_dim, max_units, num_branches)
+        branch_outputs = tf.tensordot(inputs, w_mod, axes=[[1], [0]])  # (batch, max_units, num_branches)
+        branch_outputs += self.b
+        gating_weights = self.branch_gating(inputs)  # (batch, num_branches)
+        gating_weights = tf.expand_dims(gating_weights, axis=1)  # (batch, 1, num_branches)
+        z_combined = tf.reduce_sum(branch_outputs * gating_weights, axis=-1)  # (batch, max_units)
+        # Apply dynamic connectivity and neuron mask.
+        connectivity = self.dynamic_connectivity(tf.expand_dims(self.neuron_activation_avg, axis=0))
+        connectivity = tf.cast(connectivity, z_combined.dtype)
+        mask = tf.cast(tf.expand_dims(self.neuron_mask, axis=0), z_combined.dtype)
+        z_modulated = z_combined * connectivity * mask
+        a = self.act(z_modulated)
+        # Update running average (exponential moving average)
+        batch_mean = tf.reduce_mean(a, axis=0)
+        new_avg = self.alpha * self.neuron_activation_avg + (1 - self.alpha) * tf.cast(batch_mean, self.neuron_activation_avg.dtype)
+        self.neuron_activation_avg.assign(new_avg)
+        return a
+
+    def vectorized_plasticity_update(self, pre_activity, post_activity, reward):
+        # Compute global statistics.
+        pre_mean = tf.reduce_mean(pre_activity)
+        post_mean = tf.reduce_mean(post_activity)
+        weight_mean = tf.reduce_mean(self.w)
+        # Form feature vector: shape (1,3) for meta controller input.
+        features = tf.expand_dims(tf.stack([pre_mean, post_mean, weight_mean]), axis=0)
+        # Let the meta controller compute scale, bias, and update gate.
+        scale_factor, bias_adjustment, update_gate = self.plasticity_controller(features)
+        # Compute update deltas for weights and delay in a fully vectorized manner.
+        delta_w = tf.cast(reward, tf.float32) * (update_gate * (scale_factor + bias_adjustment * self.w))
+        delta_delay = tf.cast(reward, tf.float32) * (update_gate * (scale_factor + bias_adjustment * self.delay))
+        # Clip updates.
+        delta_w = tf.clip_by_norm(delta_w, clip_norm=0.05)
+        delta_delay = tf.clip_by_norm(delta_delay, clip_norm=0.05)
+        return delta_w, delta_delay
+
+    # Old implementation no longer used
+    # def apply_plasticity(self, plasticity_delta_w, plasticity_delta_delay):
+    #     self.w.assign_add(plasticity_delta_w)
+    #     self.delay.assign_add(plasticity_delta_delay)
+
+    def apply_homeostatic_scaling(self):
+        avg_w = tf.reduce_mean(tf.abs(self.w))
+        new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
+        scaling_factor = new_target / (avg_w + 1e-6)
+        self.w.assign(self.w * scaling_factor)
+        self.avg_weight_magnitude.assign(avg_w)
+        avg_delay = tf.reduce_mean(tf.abs(self.delay))
+        new_target_delay = self.decay_factor * self.target_delay + (1 - self.decay_factor) * avg_delay
+        scaling_factor_delay = new_target_delay / (avg_delay + 1e-6)
+        self.delay.assign(self.delay * scaling_factor_delay)
+        self.avg_delay_magnitude.assign(avg_delay)
+
+    def apply_structural_plasticity(self):
+        pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
+        self.w.assign(pruned_w)
+        random_matrix = tf.random.uniform(tf.shape(self.w))
+        add_mask = tf.cast(random_matrix < self.add_prob, tf.float32)
+        new_connections = tf.where(
+            tf.logical_and(tf.equal(self.w, 0.0), tf.equal(add_mask, 1.0)),
+            tf.random.uniform(tf.shape(self.w), minval=0.01, maxval=0.05),
+            self.w)
+        self.w.assign(new_connections)
+        self.sparsity.assign(tf.reduce_mean(tf.cast(tf.equal(self.w, 0.0), tf.float32)))
+        self.adjust_prune_threshold()
+        self.adjust_add_prob()
+        pruned_delay = tf.where(tf.abs(self.delay) < self.prune_threshold, tf.zeros_like(self.delay), self.delay)
+        self.delay.assign(pruned_delay)
+        random_matrix_delay = tf.random.uniform(tf.shape(self.delay))
+        add_mask_delay = tf.cast(random_matrix_delay < self.add_prob, tf.float32)
+        new_delays = tf.where(
+            tf.logical_and(tf.equal(self.delay, 0.0), tf.equal(add_mask_delay, 1.0)),
+            tf.random.uniform(tf.shape(self.delay), minval=0.01, maxval=0.05),
+            self.delay)
+        self.delay.assign(new_delays)
+
+    def adjust_prune_threshold(self):
+        self.prune_threshold.assign(tf.cond(
+            tf.greater(self.sparsity, 0.8),
+            lambda: self.prune_threshold * self.prune_min,
+            lambda: tf.cond(tf.less(self.sparsity, 0.3),
+                            lambda: self.prune_threshold * self.prune_max,
+                            lambda: self.prune_threshold)))
+
+    def adjust_add_prob(self):
+        self.add_prob.assign(tf.cond(
+            tf.less(self.avg_weight_magnitude, 0.01),
+            lambda: self.add_prob * self.prob_min,
+            lambda: tf.cond(tf.greater(self.avg_weight_magnitude, 0.1),
+                            lambda: self.add_prob * self.prob_max,
+                            lambda: self.add_prob)))
+
+    def apply_architecture_modification(self):
+        mask_after_prune = tf.where(
+            tf.logical_and(tf.equal(self.neuron_mask, 1.0),
+                           tf.less(self.neuron_activation_avg, self.prune_activation_threshold)),
+            tf.zeros_like(self.neuron_mask),
+            self.neuron_mask)
+        active_values = tf.boolean_mask(self.neuron_activation_avg, tf.equal(mask_after_prune, 1.0))
+        growth_cond = tf.cond(
+            tf.greater(tf.size(active_values), 0),
+            lambda: tf.greater(tf.reduce_mean(active_values), self.growth_activation_threshold),
+            lambda: tf.constant(False)
         )
-        self.plasticity_weight_multiplier = self.add_weight(
+        def grow_neuron():
+            inactive_indices = tf.squeeze(tf.where(tf.equal(mask_after_prune, 0.0)), axis=1)
+            def activate_random():
+                random_idx = tf.random.shuffle(inactive_indices)[0]
+                new_mask = tf.tensor_scatter_nd_update(mask_after_prune, [[random_idx]], [1.0])
+                return new_mask
+            new_mask = tf.cond(tf.greater(tf.shape(inactive_indices)[0], 0),
+                               activate_random,
+                               lambda: mask_after_prune)
+            return new_mask
+        new_mask = tf.cond(growth_cond, grow_neuron, lambda: mask_after_prune)
+        self.neuron_mask.assign(new_mask)
+
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[-1] = self.max_units
+        return tuple(output_shape)
+
+# ==========================
+# MoE Dynamic Plastic Layer
+# ==========================
+class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
+    def __init__(self, num_experts, max_units, initial_units, plasticity_controller, neural_ode_plasticity, **kwargs):
+        super(MoE_DynamicPlasticLayer, self).__init__(**kwargs)
+        self.num_experts = num_experts
+        self.max_units = max_units
+        self.initial_units = initial_units
+        self.neural_ode_plasticity = neural_ode_plasticity
+        self.plasticity_controller = plasticity_controller
+        self.experts = [DynamicPlasticDenseDendritic(self.max_units, self.initial_units, self.plasticity_controller)
+                        for i in range(self.num_experts)]
+        self.gating_network = tf.keras.Sequential([
+            tf.keras.layers.Dense(self.num_experts*4, activation='relu', name='moe_dens1'),
+            tf.keras.layers.Dense(self.num_experts, activation='softmax', name='moe_dens2')
+        ])
+
+    def call(self, inputs, latent=None):
+        # Compute expert outputs in parallel.
+        expert_outputs = [expert(inputs) for expert in self.experts]
+        expert_stack = tf.stack(expert_outputs, axis=-1)  # (batch, features, num_experts)
+        gating_input = tf.concat([inputs, latent], axis=-1) if latent is not None else inputs
+        gate_weights = self.gating_network(gating_input)  # (batch, num_experts)
+        gate_weights = tf.expand_dims(gate_weights, axis=1)  # (batch, 1, num_experts)
+        output = tf.reduce_sum(expert_stack * gate_weights, axis=-1)
+        return output
+
+    def batch_plasticity_update(self, pre_activity, post_activity, reward, neuromod_signal,
+                                scale_factor, bias_adjustment, update_gate, gating_signal):
+        # Stack weights and delays from all experts.
+        expert_ws = tf.stack([tf.convert_to_tensor(expert.w) for expert in self.experts], axis=0)  # shape: (num_experts, input_dim, max_units, num_branches)
+        expert_delays = tf.stack([tf.convert_to_tensor(expert.delay) for expert in self.experts], axis=0)
+        # Compute global features.
+        pre_mean = tf.reduce_mean(pre_activity)
+        post_mean = tf.reduce_mean(post_activity)
+        weight_mean = tf.reduce_mean(expert_ws)
+        # (MetaPlasticityController is applied externally.)
+        # Compute update deltas using the provided meta parameters.
+        delta_ws = (self.neural_ode_plasticity(expert_ws, context=neuromod_signal) * gating_signal *
+                    tf.cast(reward, tf.float32) * (update_gate * (scale_factor + bias_adjustment * expert_ws)))
+        delta_delays = (self.neural_ode_plasticity(expert_delays, context=neuromod_signal) * gating_signal *
+                        tf.cast(reward, tf.float32) * (update_gate * (scale_factor + bias_adjustment * expert_delays)))
+        # Clip updates.
+        delta_ws = tf.clip_by_norm(delta_ws, clip_norm=0.05, axes=[1,2,3])
+        delta_delays = tf.clip_by_norm(delta_delays, clip_norm=0.05, axes=[1,2,3])
+        # Update experts' weights vectorized.
+        new_expert_ws = expert_ws + delta_ws  # * neuromod_signal
+        new_expert_delays = expert_delays + delta_delays  # * neuromod_signal
+        new_ws_list = tf.unstack(new_expert_ws, axis=0)
+        new_delays_list = tf.unstack(new_expert_delays, axis=0)
+        for i, expert in enumerate(self.experts):
+            expert.w.assign(new_ws_list[i])
+            expert.delay.assign(new_delays_list[i])
+        return delta_ws, delta_delays
+
+# ===========================
+# Meta-Plasticity Controller
+# ===========================
+class MetaPlasticityController(tf.keras.layers.Layer):
+    def __init__(self, input_dim=3, units=32, **kwargs):
+        super(MetaPlasticityController, self).__init__(**kwargs)
+        self.input_dim = input_dim
+        self.units = units
+        self.dense1 = tf.keras.layers.Dense(self.units, activation='relu', input_shape=(self.input_dim,), name='mpc_dens1')
+        # Output three scalars:
+        #   - scale_factor,
+        #   - bias_adjustment,
+        #   - raw_update_logit (to be gated with a learnable threshold)
+        self.dense2 = tf.keras.layers.Dense(3, activation='linear', name='mpc_dens2')
+    
+    def build(self, input_shape):
+        self.update_threshold = self.add_weight(
             shape=(),
             initializer=tf.keras.initializers.Constant(0.5),
             trainable=True,
-            name='plas_w_multi'
-        )
-        self.reward_scaling_factor = self.add_weight(
+            name='update_threshold')        
+        super(MetaPlasticityController, self).build(input_shape)        
+
+    def call(self, plasticity_features):
+        x = self.dense1(plasticity_features)
+        adjustments = self.dense2(x)
+        # Split outputs:
+        # adjustments[:, 0:1] -> scale_factor,
+        # adjustments[:, 1:2] -> bias_adjustment,
+        # adjustments[:, 2:3] -> raw_update_logit.
+        scale_factor = adjustments[:, 0:1]
+        bias_adjustment = adjustments[:, 1:2]
+        raw_update_logit = adjustments[:, 2:3]
+        # Compute a soft update gate: subtract the learnable threshold and apply sigmoid.
+        update_gate = tf.sigmoid(raw_update_logit - self.update_threshold)
+        return scale_factor, bias_adjustment, update_gate
+
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[-1] = self.input_dim
+        return tuple(output_shape)
+
+# ====================================================================
+# Using Neural Ordinary Differential Equations to modulate Plasticity
+# ====================================================================
+class NeuralODEPlasticity(tf.keras.layers.Layer):
+    def __init__(self, n_steps=10, context_dim=1, **kwargs):
+        """
+        Evolve a state over time using RK4 integration.
+        Args:
+            n_steps: Number of RK4 steps.
+            context_dim: Dimensionality of the context vector.
+        """
+        super(NeuralODEPlasticity, self).__init__(**kwargs)
+        self.n_steps = n_steps
+        self.context_dim = context_dim
+        # Derivative network: expects input shape (N, 1 + context_dim)
+        self.deriv_net = tf.keras.Sequential([
+            tf.keras.layers.Dense(64, activation='tanh', name='node_dens1'),
+            tf.keras.layers.Dense(1, activation='linear', name='node_dens2')
+        ])
+
+    def build(self, input_shape):
+        # dt is now a trainable parameter.
+        self.dt = self.add_weight(
             shape=(),
             initializer=tf.keras.initializers.Constant(0.1),
             trainable=True,
-            name='reward_scale_fact'
-        )
-        super(ChaoticModulation, self).build(input_shape)
+            name='integration_time')
+        super(NeuralODEPlasticity, self).build(input_shape)
 
-    def call(self, c):
-        # Logistic map: new value = r * c * (1 - c)
-        chaotic_factor = self.r * c * (1 - c)
-        return chaotic_factor
+    def call(self, initial_state, context=None):
+        # Save original shape and flatten the state.
+        orig_shape = tf.shape(initial_state)
+        state_flat = tf.reshape(initial_state, [-1])  # shape: (N,)
 
-# ===================================
-# Reinforcment style signal learning
-# ===================================
-class ReinforcementSignalLayer(tf.keras.layers.Layer):
-    def __init__(self, **kwargs):
-        super(ReinforcementSignalLayer, self).__init__(**kwargs)
+        dt = self.dt
+        h = dt / self.n_steps
+        t = tf.constant(0.0, dtype=state_flat.dtype)
+        y = state_flat
+
+        # Precompute tiled context if provided.
+        if context is not None:
+            context = tf.reshape(context, [1, self.context_dim])
+            # Tile context for each element in y.
+            context_tiled = tf.tile(context, [tf.shape(y)[0], 1])
+        else:
+            context_tiled = None
+
+        # Define the derivative function.
+        def ode_fn(t_val, y_val):
+            # Reshape y to (N, 1) for processing.
+            y_reshaped = tf.reshape(y_val, [-1, 1])
+            # If context is provided, concatenate it.
+            if context_tiled is not None:
+                y_input = tf.concat([y_reshaped, context_tiled], axis=-1)  # shape: (N, 1+context_dim)
+            else:
+                y_input = y_reshaped
+            dy = self.deriv_net(y_input)  # shape: (N, 1)
+            return tf.reshape(dy, [-1])
+        
+        # RK4 integration loop.
+        for _ in range(self.n_steps):
+            k1 = ode_fn(t, y)
+            k2 = ode_fn(t + h/2, y + h/2 * k1)
+            k3 = ode_fn(t + h/2, y + h/2 * k2)
+            k4 = ode_fn(t + h, y + h * k3)
+            y = y + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+            t += h
+
+        # Reshape y back to the original state shape.
+        new_state = tf.reshape(y, orig_shape)
+        return new_state
+
+# ====================================================
+# Recurrent Plasticity Controller with Self-Attention
+# ====================================================
+class RecurrentPlasticityController(tf.keras.layers.Layer):
+    def __init__(self, units=256, sequence_length=64, use_attention=True, **kwargs):
+        super(RecurrentPlasticityController, self).__init__(**kwargs)
+        self.sequence_length = sequence_length
+        self.units = units
+        self.use_attention = use_attention
+        self.act = LearnedQuantumActivation()
+        # Optionally include self-attention.
+        if self.use_attention:
+            self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=self.units)
+        # A GRU to process the sequence.
+        self.gru = tf.keras.layers.GRU(self.units, return_sequences=False)
+        # Final dense layer producing two output scalars.
+        self.dense = tf.keras.layers.Dense(2, activation=self.act, name='rpc_dens')
 
     def build(self, input_shape):
-        # Initialize with your current hard-coded values.
-        self.loss_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(1.0),
-            trainable=True, name="loss_weight")
-        self.recon_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.1),
-            trainable=True, name="recon_weight")
-        self.novelty_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.5),
-            trainable=True, name="novelty_weight")
-        self.uncertainty_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.05),
-            trainable=True, name="uncertainty_weight")
-        super(ReinforcementSignalLayer, self).build(input_shape)
+        # No additional weights needed.
+        super(RecurrentPlasticityController, self).build(input_shape)
 
-    def call(self, loss, recon_loss, novelty, avg_uncertainty):
-        # Compute each component using the trainable weights.
-        loss_signal = self.loss_weight * tf.sigmoid(-loss)
-        recon_signal = self.recon_weight * tf.sigmoid(-recon_loss)
-        novelty_signal = self.novelty_weight * tf.sigmoid(novelty)
-        uncertainty_signal = self.uncertainty_weight * tf.sigmoid(avg_uncertainty)
-        combined_reward = loss_signal + recon_signal + novelty_signal + uncertainty_signal
-        return combined_reward
+    def call(self, input_sequence):
+        # If attention is used, apply it.
+        if self.use_attention:
+            # Self-attention: using the sequence as both query and key.
+            attn_output = self.attention(input_sequence, input_sequence)
+        else:
+            attn_output = input_sequence  # Skip attention.
+        # Process the (possibly attended) sequence with GRU.
+        x = self.gru(attn_output)
+        adjustments = self.dense(x)  # Shape: (batch, 2)
+        return adjustments
+
+    def compute_output_shape(self, input_shape):
+        # Regardless of input, output is (batch, 2)
+        return (input_shape[0], 2)
+
+# ====================== Quantum Inspired Control Mechanisms Section =======================
 
 # ===================================================
 # Differentiable Quantum-inspired Circuit simulation
 # ===================================================
 class DifferentiableQuantumCircuit(tf.keras.layers.Layer):
-    def __init__(self, num_qubits=4, num_layers=2, **kwargs):
+    def __init__(self, num_qubits=4, num_layers=1, **kwargs):
         """
         Args:
             num_qubits: Number of qubits in the simulated circuit.
@@ -126,25 +522,23 @@ class DifferentiableQuantumCircuit(tf.keras.layers.Layer):
                 shape=(self.num_qubits,),
                 initializer=tf.keras.initializers.RandomUniform(0, 2 * 3.1416),
                 trainable=True,
-                name=f"theta_{l}"
-            ))
+                name=f"theta_{l}"))
             self.phis.append(self.add_weight(
                 shape=(self.num_qubits,),
                 initializer=tf.keras.initializers.RandomUniform(0, 2 * 3.1416),
                 trainable=True,
-                name=f"phi_{l}"
-            ))
+                name=f"phi_{l}"))
             self.lams.append(self.add_weight(
                 shape=(self.num_qubits,),
                 initializer=tf.keras.initializers.RandomUniform(0, 2 * 3.1416),
                 trainable=True,
-                name=f"lambda_{l}"
-            ))
+                name=f"lambda_{l}"))
         # Optionally, we can add fixed entangling layers between single-qubit rotations.        
         super(DifferentiableQuantumCircuit, self).build(input_shape)         
 
     def single_qubit_gate(self, theta, phi, lam):
-        """Construct a single-qubit U3 gate.
+        """
+        Construct a single-qubit U3 gate.
            U3(theta, phi, lambda) = 
              [[cos(theta/2), -exp(1j*lam)*sin(theta/2)],
               [exp(1j*phi)*sin(theta/2), exp(1j*(phi+lam))*cos(theta/2)]]
@@ -164,19 +558,6 @@ class DifferentiableQuantumCircuit(tf.keras.layers.Layer):
         row2 = tf.stack([exp_i_phi * s_complex, exp_i_phi_plus_lam * c_complex])
         gate = tf.stack([row1, row2])
         return gate
-
-    def kron(self, matrices):
-        """Compute the Kronecker product of a list of matrices."""
-        result = matrices[0]
-        for m in matrices[1:]:
-            # Using TensorFlow’s built-in Kronecker product via reshaping.
-            result = tf.reshape(result, [-1, 1]) * tf.reshape(m, [1, -1])
-            d0 = tf.shape(result)[0]
-            d1 = tf.shape(result)[1]
-            result = tf.reshape(result, [d0 * d1, 1])
-            result = tf.reshape(result, [int(tf.math.sqrt(tf.cast(tf.size(result), tf.float32))),
-                                           int(tf.math.sqrt(tf.cast(tf.size(result), tf.float32)))])
-        return result
 
     def build_full_gate(self, theta_vec, phi_vec, lam_vec):
         """Build the full circuit unitary for one layer by taking the tensor product
@@ -220,185 +601,6 @@ class DifferentiableQuantumCircuit(tf.keras.layers.Layer):
     def compute_output_shape(self, input_shape):
         return tuple(input_shape)         
 
-# ====================================================================
-# Using Neural Ordinary Differential Equations to modulate Plasticity
-# ====================================================================
-class NeuralODEPlasticity(tf.keras.layers.Layer):
-    def __init__(self, n_steps=10, context_dim=1, **kwargs):
-        """
-        Args:
-            dt: Total integration time.
-            n_steps: Number of integration steps for RK4.
-            context_dim: Dimensionality of the context vector.
-        """
-        super(NeuralODEPlasticity, self).__init__(**kwargs)
-        # self.init_dt = init_dt
-        self.n_steps = n_steps
-        self.context_dim = context_dim
-        # The derivative network expects each element's feature vector to have shape (1 + context_dim,)
-        self.deriv_net = tf.keras.Sequential([
-            tf.keras.layers.Dense(64, activation='tanh', name='node_dens1'),
-            tf.keras.layers.Dense(1, activation='linear', name='node_dens2')
-        ])         
-
-    def build(self, input_shape):
-        self.dt = self.add_weight(name='integration_time', shape=(),
-                                           initializer=tf.keras.initializers.Constant(0.1),
-                                           trainable=True)        
-        super(NeuralODEPlasticity, self).build(input_shape)        
-
-    def call(self, initial_state, context=None):
-        """
-        Evolve the state over a short time interval using RK4 integration.
-
-        Args:
-            initial_state: Tensor representing the state to be evolved (e.g., weight matrix).
-            context: Optional additional context (e.g., neuromodulatory signal) with shape compatible to (context_dim,).
-        Returns:
-            Evolved state with the same shape as initial_state.
-        """
-        self.orig_shape = tf.shape(initial_state)
-        # Flatten the state to a 1D vector.
-        state_flat = tf.reshape(initial_state, [-1])  # shape: (N,)
-        # print(f'\nstate_flat dtype: {state_flat.dtype}')
-        dt = self.dt
-        n_steps = self.n_steps
-        h = dt / n_steps
-        t = tf.constant(0.0, dtype=state_flat.dtype)
-        y = state_flat
-        # Always use a context vector: if not provided, default to zeros.
-        if context is None:
-            context = tf.zeros([self.context_dim], dtype=state_flat.dtype)
-
-        def ode_fn(t, y):
-            # Reshape y to (N, 1) so each element is processed individually.
-            y_reshaped = tf.reshape(y, [-1, 1])
-            # print(f'\ny_reshaped: {y_reshaped.shape}')
-            if context is not None:
-                # Ensure context has shape (context_dim,)
-                context_flat = tf.reshape(context, [-1])  # shape: (context_dim,)
-                # Tile context for every element in y.
-                context_tiled = tf.tile(tf.reshape(context_flat, [1, self.context_dim]), [tf.shape(y_reshaped)[0], 1])
-                # Concatenate the element value with its corresponding context.
-                y_input = tf.concat([y_reshaped, context_tiled], axis=-1)  # shape: (N, 1 + context_dim)
-                # y_input = tf.reshape(y_input, [-1, 1])
-            else:
-                y_input = y_reshaped
-            # Compute derivative for each element.
-            # print(f'\ny_input: {y_input.shape}')
-            dy = self.deriv_net(y_input)  # shape: (N, 1)
-            return tf.reshape(dy, [-1])
-        
-        # Perform fixed-step RK4 integration.
-        for _ in range(n_steps):
-            k1 = ode_fn(t, y)
-            k2 = ode_fn(t + h/2, y + h/2 * k1)
-            k3 = ode_fn(t + h/2, y + h/2 * k2)
-            k4 = ode_fn(t + h, y + h * k3)
-            y = y + (h / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
-            t += h
-        # Reshape the evolved state back to its original shape.
-        new_state = tf.reshape(y, self.orig_shape)
-        return new_state
-
-# ===========================
-# Meta-Plasticity Controller
-# ===========================
-class MetaPlasticityController(tf.keras.layers.Layer):
-    def __init__(self, input_dim=3, units=32, **kwargs):
-        super(MetaPlasticityController, self).__init__(**kwargs)
-        self.input_dim = input_dim
-        self.units = units
-        self.dense1 = tf.keras.layers.Dense(self.units, activation='relu', input_shape=(self.input_dim,), name='mpc_dens1')
-        # Output three scalars:
-        #   - scale_factor,
-        #   - bias_adjustment,
-        #   - raw_update_logit (to be gated with a learnable threshold)
-        self.dense2 = tf.keras.layers.Dense(3, activation='linear', name='mpc_dens2')
-    
-    def build(self, input_shape):
-        self.update_threshold = self.add_weight(
-            shape=(),
-            initializer=tf.keras.initializers.Constant(0.5),
-            trainable=True,
-            name='update_threshold'
-        )        
-        super(MetaPlasticityController, self).build(input_shape)        
-
-    def call(self, plasticity_features):
-        x = self.dense1(plasticity_features)
-        adjustments = self.dense2(x)
-        # Split outputs:
-        # adjustments[:, 0:1] -> scale_factor,
-        # adjustments[:, 1:2] -> bias_adjustment,
-        # adjustments[:, 2:3] -> raw_update_logit.
-        scale_factor = adjustments[:, 0:1]
-        bias_adjustment = adjustments[:, 1:2]
-        raw_update_logit = adjustments[:, 2:3]
-        # Compute a soft update gate: subtract the learnable threshold and apply sigmoid.
-        update_gate = tf.sigmoid(raw_update_logit - self.update_threshold)
-        return scale_factor, bias_adjustment, update_gate
-
-    def compute_output_shape(self, input_shape):
-        output_shape = list(input_shape)
-        output_shape[-1] = self.input_dim
-        return tuple(output_shape)
-
-# ===================================
-# Celestial Alignment inspired layer
-# ===================================
-class CelestialAlignmentLayer(tf.keras.layers.Layer):
-    def __init__(self, units=256, **kwargs):
-        """
-        Args:
-            units: The dimensionality of the modulation vector (e.g. matching feature size).
-            period: The period of the cyclic signal (e.g. 12 to mimic zodiac cycles).
-        """
-        super(CelestialAlignmentLayer, self).__init__(**kwargs)
-        self.units = units
-
-    def build(self, input_shape):
-        # Trainable phase shift and amplitude for each unit.
-        self.phase_shift = self.add_weight(
-            shape=(self.units,),
-            initializer='zeros',
-            trainable=True,
-            name="phase_shift"
-        )
-        self.amplitude = self.add_weight(
-            shape=(self.units,),
-            initializer='ones',
-            trainable=True,
-            name="amplitude"
-        )
-        self.period = self.add_weight(name='period', shape=(),
-                                           initializer=tf.keras.initializers.Constant(12.0),
-                                           trainable=True)        
-        super(CelestialAlignmentLayer, self).build(input_shape)
-
-    def call(self, inputs):
-        '''
-        inputs: shape (batch, features)
-        Generate a cyclic modulation signal. Instead of relying on tf.timestamp(),
-        which can be unstable in training, we use a continuously updated constant.
-        Here we simulate a time variable using the training step (or a fixed frequency signal).
-        For demonstration, we use a non-trainable sine wave based on a fixed "time" parameter.
-        '''
-        time_scalar = tf.cast(tf.timestamp(), tf.float32)  # Real time in seconds
-        # Create a cyclic signal: sin(2*pi*time/period + phase)
-        cyclic_signal = tf.sin(2 * math.pi * time_scalar / self.period + self.phase_shift)
-        # Scale it with the amplitude.
-        modulation = cyclic_signal * self.amplitude
-        # Expand dims to match inputs and modulate features element-wise.
-        modulation = tf.reshape(modulation, (1, self.units))
-        modulated = inputs * modulation  # Elementwise modulation
-        return modulated
-
-    def compute_output_shape(self, input_shape):
-        output_shape = list(input_shape)
-        output_shape[-1] = self.units
-        return tuple(output_shape)        
-
 # ====================================
 # Quantum Entanglement inspired Layer
 # ====================================
@@ -421,35 +623,31 @@ class RefinedQuantumEntanglementLayer(tf.keras.layers.Layer):
             f"Either match units to input shape of {input_shape[-1]} or adjust previous layers output dim at axis[-1]")
         # Real-valued representation of a complex matrix (split into real and imaginary parts)
         self.M_real = self.add_weight(
+            shape=(self.max_state_size, self.max_state_size),
+            initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
+            trainable=True,
             name="M_real",
-            shape=(self.max_state_size, self.max_state_size),
-            initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
-            dtype=tf.float32,
-            trainable=True
-        )
+            dtype=tf.float32)
         self.M_imag = self.add_weight(
-            name="M_imag",
             shape=(self.max_state_size, self.max_state_size),
             initializer=tf.keras.initializers.RandomNormal(stddev=0.1),
-            dtype=tf.float32,
-            trainable=True
-        )
+            trainable=True,
+            name="M_imag",
+            dtype=tf.float32)
         # Bias term (real-valued)
         self.bias = self.add_weight(
-            name="bias",
             shape=(self.max_state_size,),
             initializer=tf.keras.initializers.Zeros(),
-            dtype=tf.float32,
-            trainable=True
-        )
+            trainable=True,
+            name="bias",
+            dtype=tf.float32)
         # Learnable gating vector for adaptive qubit usage
         self.qubit_gate = self.add_weight(
-            name="qubit_gate",
             shape=(self.max_state_size,),
             initializer=tf.keras.initializers.Constant(1.0),
-            dtype=tf.float32,
-            trainable=True
-        )
+            trainable=True,
+            name="qubit_gate",
+            dtype=tf.float32)
         super().build(input_shape)
 
     def call(self, inputs):
@@ -470,7 +668,109 @@ class RefinedQuantumEntanglementLayer(tf.keras.layers.Layer):
         return gated_output, gate_probs
 
     def compute_output_shape(self, input_shape):
-        return tuple(input_shape)        
+        return tuple(input_shape)
+
+# ============================
+# Metacognitive Critic Module
+# ============================
+class MetacognitiveCritic(tf.keras.layers.Layer):
+    def __init__(self, hidden_units=64, **kwargs):
+        super(MetacognitiveCritic, self).__init__(**kwargs)
+        # Process each modality separately.
+        self.latent_dense = tf.keras.layers.Dense(hidden_units // 2, activation='relu', name='critic_latent')
+        self.pred_dense = tf.keras.layers.Dense(hidden_units // 2, activation='relu', name='critic_pred')
+        self.hidden_dense = tf.keras.layers.Dense(hidden_units // 2, activation='relu', name='critic_hidden')
+        self.uncertainty_dense = tf.keras.layers.Dense(hidden_units // 2, activation='relu', name='critic_uncertainty')
+        # Fuse all features.
+        self.fusion_dense = tf.keras.layers.Dense(hidden_units, activation='relu', name='critic_fusion')
+        # Outputs: gating and alignment.
+        self.out_dense = tf.keras.layers.Dense(2, activation='linear', name='critic_out')
+    
+    def build(self, input_shape):
+        # A learnable threshold for gating can be shared or separate.
+        self.meta_threshold = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.5),
+            trainable=True,
+            name='meta_threshold')
+        super(MetacognitiveCritic, self).build(input_shape)
+    
+    def call(self, latent, predictions, hidden_activation, uncertainty):
+        # Process each modality.
+        latent_feat = self.latent_dense(latent)
+        pred_feat = self.pred_dense(predictions)
+        hidden_feat = self.hidden_dense(hidden_activation)
+        uncertainty_feat = self.uncertainty_dense(uncertainty)
+        # Concatenate all features.
+        joint_input = tf.concat([latent_feat, pred_feat, hidden_feat, uncertainty_feat], axis=-1)
+        fused = self.fusion_dense(joint_input)
+        outputs = self.out_dense(fused)  # (batch, 2)
+        # Split outputs into gating and alignment signals.
+        gating_signal = tf.nn.sigmoid(outputs[:, 0:1] - self.meta_threshold)
+        alignment_score = tf.nn.sigmoid(outputs[:, 1:2])
+        return gating_signal, alignment_score
+        
+# =================================
+# Chaos-inspired Modulation Module
+# =================================
+class ChaoticModulation(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(ChaoticModulation, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        # Register r as a trainable scalar parameter.
+        self.r = self.add_weight(
+            shape=(),
+            initializer=tf.keras.initializers.Constant(3.8),
+            trainable=True,
+            name='chaotic_r')
+        self.plasticity_weight_multiplier = self.add_weight(
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.5),
+            trainable=True,
+            name='plas_w_multi')
+        self.reward_scaling_factor = self.add_weight(
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.1),
+            trainable=True,
+            name='reward_scale_fact')
+        super(ChaoticModulation, self).build(input_shape)
+
+    def call(self, c):
+        # Logistic map: new value = r * c * (1 - c)
+        chaotic_factor = self.r * c * (1 - c)
+        return chaotic_factor
+
+# ===================================
+# Reinforcment style signal learning
+# ===================================
+class ReinforcementSignalLayer(tf.keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(ReinforcementSignalLayer, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        # Initialize with your current hard-coded values.
+        self.loss_weight = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(1.0),
+            trainable=True, name="loss_weight")
+        self.recon_weight = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.1),
+            trainable=True, name="recon_weight")
+        self.novelty_weight = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.5),
+            trainable=True, name="novelty_weight")
+        self.uncertainty_weight = self.add_weight(
+            shape=(), initializer=tf.keras.initializers.Constant(0.05),
+            trainable=True, name="uncertainty_weight")
+        super(ReinforcementSignalLayer, self).build(input_shape)
+
+    def call(self, loss, recon_loss, novelty, avg_uncertainty):
+        # Compute each component using the trainable weights.
+        loss_signal = self.loss_weight * tf.sigmoid(-loss)
+        recon_signal = self.recon_weight * tf.sigmoid(-recon_loss)
+        novelty_signal = self.novelty_weight * tf.sigmoid(novelty)
+        uncertainty_signal = self.uncertainty_weight * tf.sigmoid(avg_uncertainty)
+        combined_reward = loss_signal + recon_signal + novelty_signal + uncertainty_signal
+        return combined_reward
 
 # =========================================================================
 # Learned Activations combined with Quantum-Inspired Stochastic Activation
@@ -481,15 +781,21 @@ class LearnedQuantumActivation(tf.keras.layers.Layer):
         super(LearnedQuantumActivation, self).__init__(**kwargs)
 
     def build(self, input_shape):
-        self.w = self.add_weight(name='activation_weights', shape=(9,),
-                                 initializer='ones', trainable=True)
-        self.temperature = self.add_weight(name='temperature', shape=(),
-                                           initializer=tf.keras.initializers.Constant(0.5),
-                                           trainable=True)
+        # We have 9 candidate activation functions (8 computed + identity)
+        self.act_w = self.add_weight(
+            shape=(9,),
+            initializer=tf.keras.initializers.Ones(),
+            trainable=True,
+            name='activation_weights')
+        self.act_temperature = self.add_weight(
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.5),
+            trainable=True,
+            name='activation_temperature')
         super(LearnedQuantumActivation, self).build(input_shape)
     
     def call(self, inputs, training=True):
-        # Compute multiple activations
+        # Compute candidate activations.
         sig = tf.keras.activations.sigmoid(inputs)
         elu = tf.keras.activations.elu(inputs)
         tanh = tf.keras.activations.tanh(inputs)
@@ -498,50 +804,30 @@ class LearnedQuantumActivation(tf.keras.layers.Layer):
         gelu = tf.keras.activations.gelu(inputs)
         selu = tf.keras.activations.selu(inputs)
         mish = tf.keras.activations.mish(inputs)
-        linear = 0.0  # Acts as a "do-nothing" activation
-        # Compute softmax-weighted activation mixture
-        weights = tf.nn.softmax(self.w)
-        base_activation = (weights[0]*sig + weights[1]*elu + weights[2]*tanh +
-                           weights[3]*relu + weights[4]*silu + weights[5]*gelu +
-                           weights[6]*selu + weights[7]*mish + weights[8]*linear)
-        # Generate stochastic noise (quantum-inspired phase noise)
-        phase_noise = tf.random.normal(tf.shape(inputs)) * self.temperature
-        # Apply noise based on the sign of base activation
-        if training:  # Apply stochasticity only during training
-            noisy_activation = tf.where(base_activation > 0, 
-                                        base_activation + phase_noise, 
-                                        base_activation - tf.abs(phase_noise))
-        else:
-            noisy_activation = base_activation  # No noise during inference
+        linear = inputs  # Identity activation
+
+        # Stack all candidate activations along a new dimension.
+        # If inputs has shape (batch, ...), the stacked tensor will have shape (batch, ..., 9).
+        acts = tf.stack([sig, elu, tanh, relu, silu, gelu, selu, mish, linear], axis=-1)
+        
+        # Compute softmax of learnable weights to ensure they form a valid convex combination.
+        weights = tf.nn.softmax(self.act_w)  # Shape: (9,)
+        
+        # Compute weighted sum across candidate activations.
+        base_activation = tf.reduce_sum(acts * weights, axis=-1)
+        
+        # Generate stochastic phase noise.
+        phase_noise = tf.random.normal(tf.shape(inputs)) * self.act_temperature
+        
+        # Apply noise: add noise for positive activations, subtract absolute noise for negative ones.
+        noisy_activation = tf.where(base_activation > 0,
+                                    base_activation + phase_noise,
+                                    base_activation - tf.abs(phase_noise)) if training else base_activation
+        
         return noisy_activation
 
     def compute_output_shape(self, input_shape):
-        return tuple(input_shape)        
-
-# ====================================================
-# Recurrent Plasticity Controller with Self-Attention
-# ====================================================
-class RecurrentPlasticityController(tf.keras.layers.Layer):
-    def __init__(self, units=256, sequence_length=10, **kwargs):
-        super(RecurrentPlasticityController, self).__init__(**kwargs)
-        self.sequence_length = sequence_length
-        self.units = units
-        self.act = LearnedQuantumActivation()
-        self.gru = tf.keras.layers.GRU(self.units, return_sequences=False)
-        self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=self.units)
-        self.dense = tf.keras.layers.Dense(2, activation=self.act, name='rpc_dens')        
-        
-    def build(self, input_shape):
-        super(RecurrentPlasticityController, self).build(input_shape)
-        
-    def call(self, input_sequence):
-        attn_output = self.attention(input_sequence, input_sequence)
-        x = self.gru(attn_output)
-        adjustments = self.dense(x)
-        return adjustments
-
-    def compute_output_shape(self, input_shape):
-        return tuple(input_shape)        
+        return input_shape
 
 # =============================================================================
 # Unsupervised Feature Extractor (Autoencoder with U-Net inspired architecture)
@@ -589,259 +875,6 @@ class UnsupervisedFeatureExtractor(tf.keras.Model):
     def compute_output_shape(self, input_shape):
         return tuple(input_shape)        
 
-# ============================================================================
-# Dynamic Connectivity: Using learned activation and unsupervised latent cues
-# ============================================================================
-class DynamicConnectivity(tf.keras.layers.Layer):
-    def __init__(self, max_units, **kwargs):
-        super(DynamicConnectivity, self).__init__(**kwargs)
-        self.max_units = max_units
-        self.act = LearnedQuantumActivation()
-        self.attention_net = tf.keras.Sequential([
-            tf.keras.layers.Dense(32, activation=self.act, name='dc_dens1'),
-            tf.keras.layers.Dense(self.max_units, activation='sigmoid', name='dc_dens2')
-        ])        
-        
-    def build(self, input_shape):
-        super(DynamicConnectivity, self).build(input_shape)
-    
-    def call(self, neuron_features):
-        connectivity = self.attention_net(neuron_features)
-        return connectivity
-
-# ====================================================
-# Dynamic Plastic Dense Layer with Dendritic Branches
-# ====================================================
-class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
-    def __init__(self, max_units, initial_units, plasticity_controller, num_branches=4, **kwargs):
-        super(DynamicPlasticDenseDendritic, self).__init__(**kwargs)
-        self.max_units = max_units
-        self.initial_units = initial_units
-        self.plasticity_controller = plasticity_controller
-        self.num_branches = num_branches
-        self.act = LearnedQuantumActivation()
-        self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)        
-        # Plasticity & homeostasis parameters.
-        self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
-        self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)
-        self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-        self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-        self.avg_delay_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-        # Neuron mask and running average (stored as float32 for stability).
-        init_mask = [1] * initial_units + [0] * (max_units - initial_units)
-        self.neuron_mask = tf.Variable(init_mask, trainable=False, dtype=tf.float32)
-        self.neuron_activation_avg = tf.Variable(tf.zeros([max_units], dtype=tf.float32), trainable=False)
-        # In-graph circular buffer for meta-plasticity features.
-        seq_len = self.plasticity_controller.sequence_length
-        self.feature_history = self.add_weight(
-            shape=(seq_len, 4), initializer='zeros', trainable=False, name='feature_history'
-        )
-        self.feature_history_index = tf.Variable(0, trainable=False, dtype=tf.int32)
-        # Gating mechanism to combine dendritic branch outputs.
-        self.branch_gating = tf.keras.layers.Dense(self.num_branches, activation='softmax', name="branch_gating")        
-
-    def build(self, input_shape):
-        input_dim = int(input_shape[-1])
-        # Weight: shape (input_dim, max_units, num_branches)
-        self.w = self.add_weight(
-            shape=(input_dim, self.max_units, self.num_branches), initializer='glorot_uniform',
-            trainable=True, name='dpd_kernel')
-        # Bias: shape (max_units, num_branches)
-        self.b = self.add_weight(
-            shape=(self.max_units, self.num_branches), initializer='zeros',
-            trainable=True, name='dpd_bias')
-        # Delay for each branch.
-        self.delay = self.add_weight(
-            shape=(input_dim, self.max_units, self.num_branches), initializer='zeros',
-            trainable=True, name='delay')
-        # Other trainable variables
-        self.decay_factor = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.9),
-            trainable=True, name="decay_factor")
-        self.prune_activation_threshold = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.01),
-            trainable=True, name="prune_activation_threshold") 
-        self.growth_activation_threshold = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.8),
-            trainable=True, name="growth_activation_threshold") 
-        self.target_avg = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.2),
-            trainable=True, name="target_avg") 
-        self.target_delay = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.2),
-            trainable=True, name="target_delay")
-        self.alpha = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.9),
-            trainable=True, name="alpha")
-        self.prune_min = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(1.05),
-            trainable=True, name="prune_min")
-        self.prune_max = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.95),
-            trainable=True, name="prune_max")
-        self.prob_min = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(1.05),
-            trainable=True, name="prob_min") 
-        self.prob_max = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.95),
-            trainable=True, name="prob_max")         
-        super(DynamicPlasticDenseDendritic, self).build(input_shape)
-
-    def call(self, inputs):
-        # Vectorized branch computation.
-        w_mod = self.w * tf.math.sigmoid(self.delay)  # (input_dim, max_units, num_branches)
-        branch_outputs = tf.tensordot(inputs, w_mod, axes=[[1], [0]])  # (batch, max_units, num_branches)
-        branch_outputs += self.b  # Bias broadcasted
-        gating_weights = self.branch_gating(inputs)  # (batch, num_branches)
-        gating_weights = tf.expand_dims(gating_weights, axis=1)  # (batch, 1, num_branches)
-        z_combined = tf.reduce_sum(branch_outputs * gating_weights, axis=-1)  # (batch, max_units)
-        # Apply dynamic connectivity and neuron mask (cast to match z_combined dtype).
-        connectivity = self.dynamic_connectivity(tf.expand_dims(self.neuron_activation_avg, axis=0))
-        connectivity = tf.cast(connectivity, z_combined.dtype)
-        mask = tf.cast(tf.expand_dims(self.neuron_mask, axis=0), z_combined.dtype)
-        z_modulated = z_combined * connectivity * mask
-        a = self.act(z_modulated)
-        # Update running average of activations.
-        batch_mean = tf.reduce_mean(a, axis=0)
-        alpha = tf.cast(self.alpha, self.neuron_activation_avg.dtype)
-        new_avg = alpha * self.neuron_activation_avg + (1 - alpha) * tf.cast(batch_mean, self.neuron_activation_avg.dtype)
-        self.neuron_activation_avg.assign(new_avg)
-        return a
-
-    def plasticity_update(self, pre_activity, post_activity, reward):
-        pre_mean = tf.reduce_mean(pre_activity)
-        post_mean = tf.reduce_mean(post_activity)
-        weight_mean = tf.reduce_mean(self.w)
-        new_feature = tf.stack([pre_mean, post_mean, weight_mean, tf.cast(reward, tf.float32)])
-        seq_len = self.plasticity_controller.sequence_length
-        idx = self.feature_history_index % seq_len
-        updated_history = tf.tensor_scatter_nd_update(self.feature_history, [[idx]], [new_feature])
-        self.feature_history.assign(updated_history)
-        self.feature_history_index.assign_add(1)
-        
-        # Only update if sufficient history is accumulated.
-        def no_update():
-            return (tf.zeros_like(self.w), tf.zeros_like(self.delay))
-        
-        def do_update():
-            adjustments = self.plasticity_controller(tf.expand_dims(self.feature_history, axis=0))  # (1, 2)
-            delta_add, delta_mult = adjustments[0, 0], adjustments[0, 1]
-            plasticity_delta_w = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.w)
-            plasticity_delta_delay = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.delay)
-            return plasticity_delta_w, plasticity_delta_delay
-        
-        return tf.cond(tf.greater_equal(self.feature_history_index, seq_len),
-                       do_update, no_update)
-    
-    def apply_plasticity(self, plasticity_delta_w, plasticity_delta_delay):
-        self.w.assign_add(plasticity_delta_w)
-        self.delay.assign_add(plasticity_delta_delay)
-    
-    def apply_homeostatic_scaling(self):
-        avg_w = tf.reduce_mean(tf.abs(self.w))
-        new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
-        scaling_factor = new_target / (avg_w + tf.cast(1e-6, avg_w.dtype))
-        self.w.assign(self.w * scaling_factor)
-        self.avg_weight_magnitude.assign(avg_w)
-        avg_delay = tf.reduce_mean(tf.abs(self.delay))
-        new_target_delay = self.decay_factor * self.target_delay + (1 - self.decay_factor) * avg_delay
-        scaling_factor_delay = new_target_delay / (avg_delay + tf.cast(1e-6, avg_delay.dtype))
-        self.delay.assign(self.delay * scaling_factor_delay)
-        self.avg_delay_magnitude.assign(avg_delay)
-    
-    def apply_structural_plasticity(self):
-        pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
-        self.w.assign(pruned_w)
-        random_matrix = tf.random.uniform(tf.shape(self.w))
-        add_mask = tf.cast(random_matrix < self.add_prob, tf.float32)
-        new_connections = tf.where(tf.logical_and(tf.equal(self.w, 0.0), tf.equal(add_mask, 1.0)),
-                                    tf.random.uniform(tf.shape(self.w), minval=0.01, maxval=0.05),
-                                    self.w)
-        self.w.assign(new_connections)
-        self.sparsity.assign(tf.reduce_mean(tf.cast(tf.equal(self.w, 0.0), tf.float32)))
-        self.adjust_prune_threshold()
-        self.adjust_add_prob()
-        pruned_delay = tf.where(tf.abs(self.delay) < self.prune_threshold, tf.zeros_like(self.delay), self.delay)
-        self.delay.assign(pruned_delay)
-        random_matrix_delay = tf.random.uniform(tf.shape(self.delay))
-        add_mask_delay = tf.cast(random_matrix_delay < self.add_prob, tf.float32)
-        new_delays = tf.where(tf.logical_and(tf.equal(self.delay, 0.0), tf.equal(add_mask_delay, 1.0)),
-                               tf.random.uniform(tf.shape(self.delay), minval=0.01, maxval=0.05),
-                               self.delay)
-        self.delay.assign(new_delays)
-    
-    def adjust_prune_threshold(self):
-        self.prune_threshold.assign(tf.cond(tf.greater(self.sparsity, 0.8),
-                                              lambda: self.prune_threshold * self.prune_min,
-                                              lambda: tf.cond(tf.less(self.sparsity, 0.3),
-                                                              lambda: self.prune_threshold * self.prune_max,
-                                                              lambda: self.prune_threshold)))
-    
-    def adjust_add_prob(self):
-        self.add_prob.assign(tf.cond(tf.less(self.avg_weight_magnitude, 0.01),
-                                       lambda: self.add_prob * self.prob_min,
-                                       lambda: tf.cond(tf.greater(self.avg_weight_magnitude, 0.1),
-                                                       lambda: self.add_prob * self.prob_max,
-                                                       lambda: self.add_prob)))
-
-    def apply_architecture_modification(self):
-        mask_after_prune = tf.where(
-            tf.logical_and(tf.equal(self.neuron_mask, 1.0),
-                           tf.less(self.neuron_activation_avg, self.prune_activation_threshold)),
-            tf.zeros_like(self.neuron_mask),
-            self.neuron_mask
-        )
-        active_values = tf.boolean_mask(self.neuron_activation_avg, tf.equal(mask_after_prune, 1.0))
-        growth_cond = tf.cond(
-            tf.greater(tf.size(active_values), 0),
-            lambda: tf.greater(tf.reduce_mean(active_values), self.growth_activation_threshold),
-            lambda: tf.constant(False)
-        )
-        def grow_neuron():
-            inactive_indices = tf.squeeze(tf.where(tf.equal(mask_after_prune, 0.0)), axis=1)
-            def activate_random():
-                random_idx = tf.random.shuffle(inactive_indices)[0]
-                new_mask = tf.tensor_scatter_nd_update(mask_after_prune, [[random_idx]], [1.0])
-                return new_mask
-            new_mask = tf.cond(tf.greater(tf.shape(inactive_indices)[0], 0),
-                               activate_random,
-                               lambda: mask_after_prune)
-            return new_mask
-        new_mask = tf.cond(growth_cond, grow_neuron, lambda: mask_after_prune)
-        self.neuron_mask.assign(new_mask)
-
-    def compute_output_shape(self, input_shape):
-        output_shape = list(input_shape)
-        output_shape[-1] = self.max_units
-        return tuple(output_shape)        
-
-# ==========================
-# MoE Dynamic Plastic Layer
-# ==========================
-class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
-    def __init__(self, num_experts, max_units, initial_units, plasticity_controller, **kwargs):
-        super(MoE_DynamicPlasticLayer, self).__init__(**kwargs)
-        self.num_experts = num_experts
-        self.max_units = max_units
-        self.initial_units = initial_units
-        self.plasticity_controller = plasticity_controller
-        self.experts = [DynamicPlasticDenseDendritic(self.max_units, self.initial_units, self.plasticity_controller)
-                        for _ in range(self.num_experts)]
-        self.gating_network = tf.keras.Sequential([
-            tf.keras.layers.Dense(self.num_experts*4, activation='relu', name='moe_dens1'),
-            tf.keras.layers.Dense(self.num_experts, activation='softmax', name='moe_dens2')
-        ])        
-    
-    def call(self, inputs, latent=None):
-        expert_outputs = [expert(inputs) for expert in self.experts]
-        expert_stack = tf.stack(expert_outputs, axis=-1)  # (batch, features, num_experts)
-        gating_input = tf.concat([inputs, latent], axis=-1) if latent is not None else inputs
-        gate_weights = self.gating_network(gating_input)  # (batch, num_experts)
-        gate_weights = tf.expand_dims(gate_weights, axis=1)  # (batch, 1, num_experts)
-        output = tf.reduce_sum(expert_stack * gate_weights, axis=-1)
-        return output
-     
-
 # =======================================
 # Episodic Memory for Continual Learning
 # =======================================
@@ -850,43 +883,57 @@ class EpisodicMemory(tf.keras.layers.Layer):
         super(EpisodicMemory, self).__init__(**kwargs)
         self.memory_size = memory_size
         self.memory_dim = memory_dim
-        self.write_layer = tf.keras.layers.Dense(self.memory_dim, activation='tanh', name='em_dens1')
-        self.read_layer = tf.keras.layers.Dense(self.memory_size, activation='softmax', name='em_dens2')        
 
     def build(self, input_shape):
+        # Initialize memory matrix; non-trainable but updated differentiably.
         self.memory = self.add_weight(
             shape=(self.memory_size, self.memory_dim),
             initializer='glorot_uniform',
             trainable=False,
             name='episodic_memory'
         )
+        # A dense layer to generate candidate write vectors.
+        self.write_layer = tf.keras.layers.Dense(self.memory_dim, activation='tanh', name='em_write')
+        # A dense layer to compute attention weights for memory updates.
+        self.attention_layer = tf.keras.layers.Dense(self.memory_size, activation='softmax', name='em_attention')
+        # A learned update gate for memory blending.
+        self.update_gate = self.add_weight(
+            shape=(self.memory_size,),
+            initializer=tf.keras.initializers.Constant(0.5),
+            trainable=True, name="update_gate"
+        )
         super(EpisodicMemory, self).build(input_shape)
-    
+
     def call(self, inputs):
-        attention = self.read_layer(inputs)  # (batch, memory_size)
-        read_vector = tf.matmul(tf.expand_dims(attention, 1), self.memory)
-        read_vector = tf.squeeze(read_vector, axis=1)
-        write_vector = self.write_layer(inputs)
-        aggregated_write_vector = tf.reduce_mean(write_vector, axis=0)
-        idx = tf.random.uniform(shape=[], maxval=self.memory_size, dtype=tf.int32)
-        memory_update = tf.tensor_scatter_nd_update(self.memory, [[idx]], [aggregated_write_vector])
-        self.memory.assign(memory_update)
+        # Read: compute attention over memory and generate read vector.
+        read_attention = self.attention_layer(inputs)  # shape: (batch, memory_size)
+        read_vector = tf.matmul(read_attention, self.memory)  # shape: (batch, memory_dim)
+
+        # Write: generate candidate write vector.
+        candidate_write = self.write_layer(inputs)  # shape: (batch, memory_dim)
+        # Aggregate write vector across the batch.
+        aggregated_write = tf.reduce_mean(candidate_write, axis=0)  # shape: (memory_dim,)
+
+        # Compute update weights for all memory slots based on input-derived attention.
+        write_attention = tf.reduce_mean(read_attention, axis=0)  # shape: (memory_size,)
+        # Combine with learned update gate.
+        update_weights = write_attention * self.update_gate  # shape: (memory_size,)
+        update_weights = tf.expand_dims(update_weights, axis=-1)  # shape: (memory_size, 1)
+
+        # Perform a differentiable update: blend the current memory with the aggregated write.
+        self.memory.assign(self.memory * (1 - update_weights) + update_weights * aggregated_write)
+
         return read_vector
-
-    def compute_output_shape(self, input_shape):
-        output_shape = list(input_shape)
-        output_shape[-1] = self.memory_size
-        return tuple(output_shape)        
-
+        
 # ===============================================================================
 # Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer
 # ===============================================================================
 class PlasticityModelMoE(tf.keras.Model):
-    def __init__(self, h, w, plasticity_controller, units=128, num_experts=2, max_units=128, 
+    def __init__(self, h, w, units=128, num_experts=1, num_layers=1, max_units=128, 
                  initial_units=32, num_classes=10, memory_size=10, memory_dim=64, **kwargs):
         super(PlasticityModelMoE, self).__init__(**kwargs)
         self.units = units
-        self.plasticity_controller = plasticity_controller
+        # self.plasticity_controller = plasticity_controller
         self.num_experts = num_experts
         self.max_units = max_units 
         self.initial_units = initial_units
@@ -906,11 +953,11 @@ class PlasticityModelMoE(tf.keras.Model):
         # Project hidden activations to dimension 16 (for 4 qubits: 2**4 = 16)
         self.quantum_dense = tf.keras.layers.Dense(16, activation=self.act, name='quantum_dense')
         self.quantum_branch = RefinedQuantumEntanglementLayer(num_qubits=4, name="QuantumEntanglement")
-        self.quantum_circuit = DifferentiableQuantumCircuit(num_qubits=4, num_layers=2, name="DifferentiableQuantumCircuit")
+        self.quantum_circuit = DifferentiableQuantumCircuit(num_qubits=4, num_layers=1, name="DifferentiableQuantumCircuit")
         # Instantiate plasticity control layers
-        self.hidden = MoE_DynamicPlasticLayer(self.num_experts, self.max_units, self.initial_units, self.plasticity_controller)        
-        self.meta_plasticity_controller = MetaPlasticityController(units=self.units)
         self.neural_ode_plasticity = NeuralODEPlasticity(n_steps=10)
+        self.meta_plasticity_controller = MetaPlasticityController(units=self.units)
+        self.hidden = MoE_DynamicPlasticLayer(self.num_experts, self.max_units, self.initial_units, self.meta_plasticity_controller, self.neural_ode_plasticity)        
         self.chaotic_modulator = ChaoticModulation()
         # Instantiate other custom layers
         self.unsupervised_extractor = UnsupervisedFeatureExtractor(self.units)
@@ -927,11 +974,15 @@ class PlasticityModelMoE(tf.keras.Model):
     def build(self, input_shape):
         # Initialize loss weights as trainable variables.
         self.recon_loss_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.1),
-            trainable=True, name="recon_loss_weight")
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.1),
+            trainable=True,
+            name="recon_loss_weight")
         self.uncertainty_loss_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(0.05),
-            trainable=True, name="uncertainty_loss_weight")
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.05),
+            trainable=True,
+            name="uncertainty_loss_weight")
         super(PlasticityModelMoE, self).build(input_shape)        
 
     def call(self, x, training=False):
@@ -970,7 +1021,7 @@ class PlasticityModelMoE(tf.keras.Model):
         class_out = self.classification_head(class_out)
 
         # --- Critic outputs ---
-        gating_signal, alignment_score = self.critic(projected_memory, class_out)
+        gating_signal, alignment_score = self.critic(latent, class_out, hidden_act, quantum_entropy)
         
         # Most of these return values are for feedback purposes.
         return class_out, combined_input, hidden_act, reconstruction, uncertainty, latent, quantum_entropy, gate_probs, projected_memory, gating_signal, alignment_score 
@@ -1011,14 +1062,14 @@ def critic_alignment_loss(episodic_memory, current_predictions):
 # Main Training Loop
 # ===================
 def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
-                num_epochs=1000, homeostasis_interval=13, architecture_update_interval=21,
-                plasticity_update_interval=8, plasticity_start_epoch=3,
+                num_epochs=1000, homeostasis_interval=10, architecture_update_interval=2,
+                plasticity_update_interval=10, plasticity_start_epoch=1,
                 early_stop_patience=100, early_stop_min_delta=1e-4, learning_rate=1e-3,
                 critic_loss_weight=0.1):
     # Set up optimizers.
     optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
-    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=1e-3)
-    critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=1e-3)
+    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
+    critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     recon_loss_fn = tf.keras.losses.Huber()
 
@@ -1043,7 +1094,9 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     best_val_loss = np.inf
     best_val_recon_loss = np.inf
     patience_counter = 0
+    recon_patience_counter = 0
     best_weights = None
+    recon_best_weights = None
 
     # Integrated training step: one forward/backward pass for both model and critic.
     def train_step(images, labels, plasticity_weight_val):
@@ -1119,27 +1172,21 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                 chaotic_factor = model.chaotic_modulator(global_plasticity_weight_multiplier.numpy())
                 global_plasticity_weight_multiplier.assign(chaotic_factor)
                 global_reward_scaling_factor.assign(chaotic_factor)
-                context = neuromod_signal
-                pre_mean = tf.reduce_mean(pre_activity)
-                post_mean = tf.reduce_mean(post_activity)
-                for expert in model.hidden.experts:
-                    avg_weight = tf.reduce_mean(tf.abs(expert.w))
-                    plasticity_features = tf.expand_dims(tf.stack([pre_mean, post_mean, avg_weight]), axis=0)
-                    scale_factor, bias_adjustment, update_gate = model.meta_plasticity_controller(plasticity_features)
-                    delta_w, delta_delay = expert.plasticity_update(pre_activity, post_activity, reward)
-                    # Modulate these updates with the gating signal from the critic.
-                    gate_modulation = tf.reduce_mean(gating_signal)
-                    delta_w_mod = gate_modulation * delta_w
-                    delta_delay_mod = gate_modulation * delta_delay
-                    plasticity_weight_cast = tf.cast(plasticity_weight_val, delta_w.dtype)
-                    # Scale the delta update by the update gate.
-                    delta_w = update_gate * ((delta_w_mod * scale_factor + bias_adjustment)
-                                             * plasticity_weight_cast * neuromod_signal * chaotic_factor)
-                    delta_w = tf.clip_by_norm(delta_w, clip_norm=0.05)
-                    delta_delay = tf.clip_by_norm(delta_delay_mod, clip_norm=0.05)
-                    updated_w = model.neural_ode_plasticity(expert.w, context=context) * delta_w
-                    updated_delay = model.neural_ode_plasticity(expert.delay, context=context) * delta_delay
-                    expert.apply_plasticity(updated_w, updated_delay)
+
+                # Create a plasticity feature vector for meta plasticity controller.
+                all_ws = tf.stack([tf.convert_to_tensor(expert.w) for expert in model.hidden.experts], axis=0) # Shape: (num_experts, ...)
+                avg_weight = tf.reduce_mean(tf.abs(all_ws))
+                plasticity_features = tf.stack([tf.reduce_mean(pre_activity),
+                                                tf.reduce_mean(post_activity),
+                                                avg_weight], axis=0)
+                plasticity_features = tf.expand_dims(plasticity_features, axis=0)  # shape: (1,3)
+                scale_factor, bias_adjustment, update_gate = model.meta_plasticity_controller(plasticity_features)
+
+                gate_modulation = tf.reduce_mean(gating_signal)
+                # Apply the batched plasticity update across all experts.
+                delta_ws, delta_delays = model.hidden.batch_plasticity_update(pre_activity, post_activity, reward,
+                                                                               neuromod_signal,
+                                                                               scale_factor, bias_adjustment, update_gate, gate_modulation)
 
             if tf.equal(global_step % homeostasis_interval, 0):
                 for expert in model.hidden.experts:
@@ -1151,7 +1198,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                     expert.apply_architecture_modification()
 
             global_step.assign_add(1)
-
+        
         # Epoch logging.
         print(f"\nEpoch {epoch+1}/{num_epochs}\n"
               f"Train Loss : {train_loss_metric.result():.4f}, "
@@ -1207,7 +1254,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         else:
             recon_counter += 1
             print(f"\nNo improvement in recon validation loss for {recon_counter} epoch(s).")
-            if recon_counter >= 2:
+            if recon_counter >= recon_patience_counter:
                 if recon_best_weights is not None:
                     print("Restoring recon best weights and saving model.\n")
                     model.unsupervised_extractor.set_weights(recon_best_weights)
@@ -1285,7 +1332,8 @@ def main():
     max_units = 64
     initial_units = 16
     epochs = 1000
-    experts = 3
+    experts = 1
+    num_layers = 1
     h = 8
     w = 8
     cnn_units = h*w
@@ -1293,7 +1341,7 @@ def main():
     learning_rate = 1e-3
     
     # Load data.
-    sequence = get_base_data(num_samples=10_000)
+    sequence = get_base_data(num_samples=1_000_000)
     input_data, labels = create_windows(sequence, window_size=window_size+1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(input_data, labels)
     
@@ -1314,22 +1362,32 @@ def main():
     # Warm-ups
     dummy_input1 = tf.zeros((1, h, w, 1))
     dummy_input2 = tf.zeros((h, w))    
-    plasticity_controller = RecurrentPlasticityController(units=initial_units)
+    # plasticity_controller = RecurrentPlasticityController(units=initial_units)
     # Instantiate the Model.
-    model = PlasticityModelMoE(h, w, plasticity_controller, units=cnn_units, 
-                           num_experts=experts, max_units=max_units, initial_units=initial_units, num_classes=10)
+    model = PlasticityModelMoE(h, w, units=cnn_units, 
+                           num_experts=experts, num_layers=num_layers, max_units=max_units, initial_units=initial_units, num_classes=10)
     _ = model(dummy_input1, training=False)
-    _ = model.critic(tf.zeros([1,10]),tf.zeros([1,10]), training=False)
-    _ = plasticity_controller(tf.zeros([1,1,4]), training=False)
+    _ = model.critic(tf.zeros([1,256]),tf.zeros([1,10]),tf.zeros([1,64]),tf.zeros([1,1]),training=False)
+    # _ = plasticity_controller(tf.zeros([1,1,4]), training=False)
     _ = model.meta_plasticity_controller(tf.zeros([1,3]), training=False)
-    _ = model.neural_ode_plasticity(tf.zeros([2]), training=False)
+    _ = model.neural_ode_plasticity(tf.zeros([1]),tf.zeros([1]), training=False)
     _ = model.reinforcement_layer(tf.zeros([2]),tf.zeros([2]),tf.zeros([2]),tf.zeros([2]),training=False)
     _ = model.chaotic_modulator(tf.zeros([2]), training=False)
+    _ = model.hidden.experts[0](tf.random.normal((1, 384)), training=False)
     model.summary()
-    model_name = "MetaSynapse_NextGen_RL_v1b"
+    model_name = "MetaSynapse_NextGen_RL_v2"
     train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
-                num_epochs=epochs, homeostasis_interval=5, architecture_update_interval=8,
-                plasticity_update_interval=3, plasticity_start_epoch=10, learning_rate=learning_rate)
+                num_epochs=epochs, homeostasis_interval=13, architecture_update_interval=34,
+                plasticity_update_interval=5, plasticity_start_epoch=3, learning_rate=learning_rate)
+
+    # dummy_input = tf.random.normal((1, 32))
+    # dummy_layer = DynamicPlasticDenseDendritic(max_units=128, initial_units=32, plasticity_controller=model.meta_plasticity_controller)
+    # _ = dummy_layer(dummy_input)
+    # print(model.critic.update_threshold)  # Check that this is a tensor, not a string.
+    # print(model.meta_plasticity_controller.update_threshold)  # Check that this is a tensor, not a string.
+    # print(model.neural_ode_plasticity.dt)  # Check that this is a tensor, not a string.
+    # print(model.reinforcement_layer.w)  # Check that this is a tensor, not a string.
+    # print(model.chaotic_modulator.w)  # Check that this is a tensor, not a string.
     
 if __name__ == '__main__':
     main()
