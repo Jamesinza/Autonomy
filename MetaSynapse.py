@@ -29,32 +29,51 @@ class LearnedActivation(tf.keras.layers.Layer):
         results = (weights[0]*sig + weights[1]*elu + weights[2]*tanh +
                    weights[3]*relu + weights[4]*silu + weights[5]*gelu)
         return results
+        
+    def compute_output_shape(self, input_shape):
+        return input_shape
 
 # =============================================================================
-# 2. PlasticDenseAdvanced with recurrent meta-plasticity support.
+# 2. Hypernetwork for Dynamic Plasticity Rules.
 # =============================================================================
-class PlasticDenseAdvanced(tf.keras.layers.Layer):
-    def __init__(self, units, initial_target=0.2, decay_factor=0.9, **kwargs):
-        super(PlasticDenseAdvanced, self).__init__(**kwargs)
+class DynamicPlasticityHypernetwork(tf.keras.layers.Layer):
+    def __init__(self, hidden_units=32, **kwargs):
+        super(DynamicPlasticityHypernetwork, self).__init__(**kwargs)
+        self.dense1 = tf.keras.layers.Dense(hidden_units, activation=LearnedActivation())
+        self.dense2 = tf.keras.layers.Dense(hidden_units, activation=LearnedActivation())
+        # Output layer produces a single scalar update per connection.
+        self.out = tf.keras.layers.Dense(1, activation=None)
+        self.units = hidden_units
+        
+    def call(self, features):
+        # features: shape (batch, feature_dim); here batch covers all weight elements.
+        x = self.dense1(features)
+        x = self.dense2(x)
+        update = self.out(x)
+        return tf.squeeze(update, axis=-1)
+        
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[-1] = self.units
+        return tuple(output_shape)         
+
+# =============================================================================
+# 3. PlasticDense layer now using the hypernetwork for plasticity.
+# =============================================================================
+class PlasticDenseAdvancedHyper(tf.keras.layers.Layer):
+    def __init__(self, units, hypernetwork, initial_target=0.2, decay_factor=0.9, **kwargs):
+        super(PlasticDenseAdvancedHyper, self).__init__(**kwargs)
         self.units = units
         self.activation = LearnedActivation()
         self.decay_factor = decay_factor
+        self.hypernetwork = hypernetwork
         
         # Structural plasticity parameters.
         self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)        
         
-        # Meta-plasticity and STDP parameters.
-        self.meta_lr = tf.Variable(0.01, trainable=True, dtype=tf.float32)
-        self.A_plus = tf.Variable(0.01, trainable=True, dtype=tf.float32)
-        self.A_minus = tf.Variable(0.01, trainable=True, dtype=tf.float32)
-        
         # For homeostasis.
         self.target_avg = tf.Variable(initial_target, trainable=False, dtype=tf.float32)
-        
-        # Dynamic tau values for STDP decay.
-        self.tau_plus = tf.Variable(20.0, trainable=True, dtype=tf.float32)
-        self.tau_minus = tf.Variable(20.0, trainable=True, dtype=tf.float32)
         
         # Tracking variables.
         self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
@@ -67,31 +86,42 @@ class PlasticDenseAdvanced(tf.keras.layers.Layer):
         self.b = self.add_weight(shape=(self.units,),
                                  initializer='zeros',
                                  trainable=True, name='bias')
-        super(PlasticDenseAdvanced, self).build(input_shape)
+        super(PlasticDenseAdvancedHyper, self).build(input_shape)
 
     def call(self, inputs):
         z = tf.matmul(inputs, self.w) + self.b
         return self.activation(z)
-
+    
     def plasticity_update(self, pre_activity, post_activity, reward):
-        # Compute a random delta_t per weight element.
-        delta_t = tf.random.uniform(tf.shape(self.w), minval=-20.0, maxval=20.0)
-        # Use the dynamic tau values.
-        stdp_update = tf.where(delta_t > 0,
-                               self.A_plus * tf.exp(-delta_t / self.tau_plus),
-                               -self.A_minus * tf.exp(delta_t / self.tau_minus))
-        pre = tf.reshape(pre_activity, [-1, 1])
-        post = tf.reshape(post_activity, [1, -1])
-        hebbian_term = pre * post
-        plasticity_delta = stdp_update * hebbian_term
-        plasticity_delta = tf.cast(reward, tf.float32) * plasticity_delta
+        # pre_activity: shape (input_dim,)
+        # post_activity: shape (units,)
+        in_features = tf.shape(self.w)[0]
+        out_features = tf.shape(self.w)[1]
+        
+        # Broadcast pre and post activities to match weight dimensions.
+        pre_broadcast = tf.reshape(pre_activity, (-1, 1))          # (in_features, 1)
+        pre_tile = tf.tile(pre_broadcast, [1, out_features])         # (in_features, out_features)
+        post_broadcast = tf.reshape(post_activity, (1, -1))          # (1, out_features)
+        post_tile = tf.tile(post_broadcast, [in_features, 1])        # (in_features, out_features)
+        # Current weight values.
+        w_val = self.w
+        # Introduce a random component per weight element.
+        random_delta = tf.random.uniform(tf.shape(self.w), minval=-20.0, maxval=20.0)
+        
+        # Construct feature vector for each connection: [pre, post, weight, random_delta].
+        features = tf.stack([pre_tile, post_tile, w_val, random_delta], axis=-1)  # shape: (in_features, out_features, 4)
+        # Flatten the feature map to apply the hypernetwork in parallel.
+        features_flat = tf.reshape(features, [-1, 4])
+        hyper_updates_flat = self.hypernetwork(features_flat)  # shape: (in_features*out_features,)
+        hyper_updates = tf.reshape(hyper_updates_flat, tf.shape(self.w))
+        
+        # Compute the final plasticity update, modulated by the reward.
+        plasticity_delta = tf.cast(reward, tf.float32) * hyper_updates
         return plasticity_delta
-
-    def apply_plasticity(self, plasticity_delta, meta_multiplier):
-        # The meta_multiplier is now provided from the recurrent meta-controller.
-        # We update using the product of meta_lr and the meta output.
-        self.w.assign_add(self.meta_lr * meta_multiplier * plasticity_delta)
-
+    
+    def apply_plasticity(self, plasticity_delta):
+        self.w.assign_add(plasticity_delta)
+    
     def apply_homeostatic_scaling(self):
         avg_w = tf.reduce_mean(tf.abs(self.w))
         new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
@@ -123,48 +153,28 @@ class PlasticDenseAdvanced(tf.keras.layers.Layer):
             self.add_prob.assign(self.add_prob * 1.05)
         elif self.avg_weight_magnitude > 0.1:
             self.add_prob.assign(self.add_prob * 0.95)
+            
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[-1] = self.units
+        return tuple(output_shape)             
 
 # =============================================================================
-# 3. Define a Recurrent Meta-Controller for dynamic plasticity.
+# 4. Model definition with the hyperplastic dense layer.
 # =============================================================================
-class RecurrentMetaController(tf.keras.Model):
-    def __init__(self, hidden_units=32, **kwargs):
-        super(RecurrentMetaController, self).__init__(**kwargs)
-        # Use a stateful RNN so that state is managed internally.
-        self.rnn = tf.keras.layers.RNN(
-            tf.keras.layers.LSTMCell(hidden_units),
-            stateful=True,  # Enables persistence of state across calls.
-            return_sequences=False,
-            return_state=False
-        )
-        self.out_dense = tf.keras.layers.Dense(1, activation='softplus')
-
-    def call(self, inputs):
-        # Ensure the inputs have shape (batch_size, time_steps, features).
-        # If inputs are (batch_size, features), add a time dimension.
-        if len(inputs.shape) == 2:
-            inputs = tf.expand_dims(inputs, axis=1)
-        x = self.rnn(inputs)
-        multiplier = self.out_dense(x)
-        return tf.squeeze(multiplier, axis=-1)
-
-
-# =============================================================================
-# 4. Define the end-to-end model for classification.
-# =============================================================================
-class PlasticityModel(tf.keras.Model):
-    def __init__(self, num_hidden=128, num_classes=10):
-        super(PlasticityModel, self).__init__()
+class PlasticityModelHyper(tf.keras.Model):
+    def __init__(self, hypernetwork, num_hidden=128, num_classes=10):
+        super(PlasticityModelHyper, self).__init__()
         self.flatten = tf.keras.layers.Flatten()
-        self.hidden = PlasticDenseAdvanced(num_hidden)
-        self.drop = tf.keras.layers.Dropout(0.3)
+        self.hidden = PlasticDenseAdvancedHyper(num_hidden, hypernetwork=hypernetwork)
+        #self.drop = tf.keras.layers.Dropout(0.1)
         self.out = tf.keras.layers.Dense(num_classes, activation='softmax')
     
     def call(self, x, training=False):
         x = self.flatten(x)
         hidden_act = self.hidden(x)
-        drop = self.drop(hidden_act, training=training)
-        output = self.out(drop)
+        #drop = self.drop(hidden_act, training=training)
+        output = self.out(hidden_act)
         return output, hidden_act
 
 # =============================================================================
@@ -208,19 +218,17 @@ def create_tf_dataset(inputs, labels, batch_size=128, shuffle=False, repeat_epoc
     return dataset
 
 # =============================================================================
-# 6. Training loop with recurrent meta-controller integration.
+# 6. Training loop with hypernetwork integration.
 # =============================================================================
-def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=5, homeostasis_interval=100):
+def train_model(model, ds_train, ds_val, ds_test, num_epochs=5, homeostasis_interval=100):
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+    optimizer.build(model.trainable_variables)
     
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
     
     global_step = 0
-    # For tracking moving magnitude of plasticity deltas.
-    moving_delta = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-    
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         for images, labels in ds_train:
@@ -240,17 +248,7 @@ def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=5,
             reward = tf.sigmoid(-loss)
             
             plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
-            # Update moving average of plasticity magnitude.
-            moving_delta.assign(0.99 * moving_delta + 0.01 * tf.reduce_mean(tf.abs(plasticity_delta)))
-            
-            # Build meta-controller input vector: shape (batch_size, features)
-            meta_input = tf.stack([loss, model.hidden.avg_weight_magnitude, moving_delta])
-            meta_input = tf.expand_dims(meta_input, axis=0)  # shape: (1, 3)
-            meta_input = tf.expand_dims(meta_input, axis=1)  # now shape: (1, 1, 3) as required
-            multiplier = meta_controller(meta_input)
-            
-            # Apply plasticity update using the meta multiplier.
-            model.hidden.apply_plasticity(plasticity_delta, multiplier)
+            model.hidden.apply_plasticity(plasticity_delta)
             
             if global_step % homeostasis_interval == 0:
                 model.hidden.apply_homeostatic_scaling()
@@ -282,8 +280,7 @@ def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=5,
             test_accuracy_metric(labels, predictions)
         print(f"Test Loss  : {test_loss_metric.result():.4f}, Test Accuracy  : {test_accuracy_metric.result():.4f}")
     
-    model.save("models/MetaSynapse_v5.keras")
-    meta_controller.save("models/MetaSynapse_v5_controller.keras")
+    model.save("models/MetaSynapse_v6.keras")
 
 # =============================================================================
 # 7. Main: Create dataset, instantiate models, and train.
@@ -291,7 +288,6 @@ def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=5,
 def main():
     batch_size = 128
     num_hidden = 128
-    hidden_units = 32
     # Load sequence data
     sequence = get_real_data(num_samples=100_000)
     inputs, labels = create_windows(sequence, window_size=65)
@@ -301,10 +297,21 @@ def main():
     ds_val = create_tf_dataset(inp_val, lbl_val, batch_size=batch_size, shuffle=False)
     ds_test = create_tf_dataset(inp_test, lbl_test, batch_size=batch_size, shuffle=False)
     
-    model = PlasticityModel(num_hidden=num_hidden, num_classes=10)
-    meta_controller = RecurrentMetaController(hidden_units=hidden_units)
+    # Instantiate the hypernetwork.
+    dummy1 = tf.zeros((1, 4))
+    dynamic_hypernet = DynamicPlasticityHypernetwork(hidden_units=32)
+    _ = dynamic_hypernet(dummy1)
     
-    train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=1000, homeostasis_interval=100)
+    # Instantiate model with hypernetwork integrated.
+    model = PlasticityModelHyper(hypernetwork=dynamic_hypernet, num_hidden=num_hidden, num_classes=10)
+    
+    # Force model to build all layers by passing a dummy input.
+    dummy2 = tf.zeros((1, 8, 8, 1))
+    _ = model(dummy2, training=False)
+    model.summary()
+    
+    # Now instantiate the optimizer after all variables are built.
+    train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_interval=10)
 
 if __name__ == '__main__':
     main()
