@@ -9,9 +9,6 @@ np.random.seed(42)
 tf.random.set_seed(42)
 
 # =============================================================================
-# 1. Learned Activation Function.
-# =============================================================================
-# =============================================================================
 # 1. Learned Activation Function: Dynamically adjust weights based on input context
 # =============================================================================
 class LearnedActivation(tf.keras.layers.Layer):
@@ -288,8 +285,7 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         new_mask = tf.cond(growth_cond, grow_neuron, lambda: mask_after_prune)
         # Assign the updated mask back to the variable.
         self.neuron_mask.assign(new_mask)
-        
-        
+                
 # --- Mixture-of-Experts Dynamic Plastic Layer ---
 class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
     def __init__(self, num_experts, max_units, initial_units, plasticity_controller, **kwargs):
@@ -302,7 +298,7 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         ]
         # A gating network that assigns a weight to each expert based on the input.
         self.gating_network = tf.keras.Sequential([
-            tf.keras.layers.Dense(32, activation='relu'),
+            tf.keras.layers.Dense(num_experts*2, activation='relu'),
             tf.keras.layers.Dense(num_experts, activation='softmax')
         ])
     @tf.function
@@ -318,7 +314,6 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         # Compute a weighted sum over experts.
         output = tf.reduce_sum(expert_stack * gate_weights, axis=-1)
         return output        
-
 
 # =============================================================================
 # 6. Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer.
@@ -358,7 +353,8 @@ class PlasticityModelMoE(tf.keras.Model):
 # =============================================================================
 def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=1000,
                 homeostasis_interval=13, architecture_update_interval=21,
-                plasticity_update_interval=8, plasticity_start_epoch=3, **kwargs):
+                plasticity_update_interval=8, plasticity_start_epoch=3,
+                early_stop_patience=10, early_stop_min_delta=1e-4, **kwargs):
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     recon_loss_fn = tf.keras.losses.MeanSquaredError()
     uncertainty_loss_fn = tf.keras.losses.MeanSquaredError()
@@ -372,7 +368,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
     train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
     
-    # Metrics for validation, test and autoencoder
+    # Metrics for validation, test and autoencoder.
     val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
     val_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
@@ -385,6 +381,12 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
     
     reward = 0.0
     global_step = 0
+
+    # Early stopping variables.
+    best_val_loss = np.inf
+    patience_counter = 0
+    best_weights = None
+    
     for epoch in range(num_epochs):
         train_iter = iter(ds_train)
         val_iter = iter(ds_val)
@@ -396,7 +398,9 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                                  (num_epochs - plasticity_start_epoch + 1))
             plasticity_weight *= global_plasticity_weight_multiplier.numpy()
             
-        # Training loop.
+        # -----------------------
+        # Training Loop.
+        # -----------------------
         for step in range(train_steps):
             images, labels = next(train_iter)        
             with tf.GradientTape() as tape:
@@ -405,21 +409,14 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                 # Unsupervised reconstruction loss.
                 recon_loss = recon_loss_fn(images, reconstruction)
                 
-                # Target uncertainty is set to 0.5 for all.
-                #uncertainty_loss = uncertainty_loss_fn(tf.fill(tf.shape(uncertainty), 0.5), uncertainty)
-                
-                # Learn uncertainty dynamically
+                # Learn uncertainty dynamically.
                 target_uncertainty = tf.reduce_mean(uncertainty)
                 uncertainty_loss = uncertainty_loss_fn(target_uncertainty, uncertainty)
                 
                 # Combine losses as needed (weights can be tuned).
-                total_loss = 0.85 * loss + 0.1 * recon_loss + 0.05 * uncertainty_loss                            
+                total_loss = loss + 0.1 * recon_loss + 0.05 * uncertainty_loss                            
                 
             grads = tape.gradient(total_loss, model.trainable_variables)
-            # Check gradient magnitudes
-            #grad_mags = [tf.norm(g) for g in grads if g is not None]
-            #print("Gradient Magnitudes:", grad_mags)
-            
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
             
             batch_errors.append(loss.numpy())
@@ -432,7 +429,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
             pre_activity = tf.reduce_mean(x_flat, axis=0)
             post_activity = tf.reduce_mean(hidden, axis=0)
             
-            # Update reward: now including unsupervised reconstruction loss.
+            # Update reward: including unsupervised reconstruction loss.
             reward = global_reward_scaling_factor.numpy() * \
                      compute_reinforcement_signals(loss, recon_loss, predictions, hidden, reward)
             
@@ -460,7 +457,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
         # Logging training metrics.
         mean_error = np.mean(batch_errors)
         std_error = np.std(batch_errors)
-        print(f"Epoch {epoch+1}/{num_epochs}\n"
+        print(f"\nEpoch {epoch+1}/{num_epochs}\n"
               f"Train Loss : {train_loss_metric.result():.4f}, "
               f"Train Accuracy : {train_accuracy_metric.result():.4f}, "
               f"Train Recon Loss : {train_recon_loss_metric.result():.4f}")
@@ -483,10 +480,12 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
             val_accuracy_metric(val_labels, val_predictions)
             val_recon_loss_metric(val_recon_loss)
 
-        print(f"Val Loss   : {val_loss_metric.result():.4f}, "
+        current_val_loss = val_loss_metric.result().numpy()
+        print(f"Val Loss   : {current_val_loss:.4f}, "
               f"Val Accuracy   : {val_accuracy_metric.result():.4f}, "
               f"Val Recon Loss : {val_recon_loss_metric.result():.4f}")
 
+        # Reset validation metrics.
         val_loss_metric.reset_state()
         val_accuracy_metric.reset_state()
         val_recon_loss_metric.reset_state()
@@ -506,13 +505,29 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
 
         print(f"Test Loss  : {test_loss_metric.result():.4f}, "
               f"Test Accuracy  : {test_accuracy_metric.result():.4f}, "
-              f"Test Recon Loss : {test_recon_loss_metric.result():.4f}\n")
+              f"Test Recon Loss : {test_recon_loss_metric.result():.4f}")
 
         test_loss_metric.reset_state()
         test_accuracy_metric.reset_state()
         test_recon_loss_metric.reset_state()
-    
-    model.save("models/MetaSynapse_NextGen_v3.keras")
+        
+        # ---------------
+        # Early Stopping Check.
+        # ---------------
+        if current_val_loss < best_val_loss - early_stop_min_delta:
+            best_val_loss = current_val_loss
+            patience_counter = 0
+            best_weights = model.get_weights()
+            print("\nValidation loss improved; resetting patience counter.")
+        else:
+            patience_counter += 1
+            print(f"\nNo improvement in validation loss for {patience_counter} epoch(s).")
+            if patience_counter >= early_stop_patience:
+                print("Early stopping triggered. Restoring best weights and ending training.\n")
+                if best_weights is not None:
+                    model.set_weights(best_weights)
+                    model.save("models/MetaSynapse_NextGen_v3b.keras")
+                break  # Exit the epoch loop.
 
 # =============================================================================
 # 8. Helper functions for chaotic modulation, neuromodulatory signal, and reinforcement signals.
@@ -593,12 +608,14 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # =============================================================================
 def main():
     batch_size = 64
-    max_units = 64
-    initial_units = 16
+    max_units = 256
+    initial_units = 128
     epochs = 1000
+    experts = 32
     h = 4
     w = 4
-    window_size = h*w    
+    window_size = h*w
+    
     # Load data.
     sequence = get_real_data(num_samples=1_000)
     inputs, labels = create_windows(sequence, window_size=window_size+1)
@@ -621,7 +638,7 @@ def main():
     _ = plasticity_controller(tf.zeros((1,1,4)))  # Warm up
     
     # Instantiate the new MoE-based model.
-    model = PlasticityModelMoE(h, w, plasticity_controller, num_experts=2, max_units=max_units, initial_units=initial_units, num_classes=10)
+    model = PlasticityModelMoE(h, w, plasticity_controller, num_experts=experts, max_units=max_units, initial_units=initial_units, num_classes=10)
     dummy_input = tf.zeros((1, h, w, 1))
     _ = model(dummy_input, training=False)
     model.summary()
@@ -629,7 +646,7 @@ def main():
     # Train the model.
     train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=epochs,
                 homeostasis_interval=13, architecture_update_interval=89,
-                plasticity_update_interval=8, plasticity_start_epoch=3)
+                plasticity_update_interval=8, plasticity_start_epoch=1)
     
 if __name__ == '__main__':
     main()
