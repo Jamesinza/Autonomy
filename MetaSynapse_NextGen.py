@@ -1,626 +1,4 @@
 import tensorflow as tf
-import numpy as np
-import pandas as pd
-import random
-import math
-
-# Set seeds for reproducibility.
-np.random.seed(42)
-tf.random.set_seed(42)
-
-# =============================================================================
-# 1. Learned Activation Function: Dynamically adjust weights based on input context
-# =============================================================================
-class LearnedActivation(tf.keras.layers.Layer):
-    def __init__(self, **kwargs):
-        super(LearnedActivation, self).__init__(**kwargs)
-        
-    def build(self, input_shape):
-        self.w = self.add_weight(name='activation_weights', shape=(8,),
-                                 initializer='ones', trainable=True)
-        super(LearnedActivation, self).build(input_shape)
-    @tf.function
-    def call(self, inputs):
-        sig = tf.keras.activations.sigmoid(inputs)
-        elu = tf.keras.activations.elu(inputs)
-        tanh = tf.keras.activations.tanh(inputs)
-        relu = tf.keras.activations.relu(inputs)
-        silu = tf.keras.activations.silu(inputs)
-        gelu = tf.keras.activations.gelu(inputs)
-        selu = tf.keras.activations.selu(inputs)
-        mish = tf.keras.activations.mish(inputs)
-        weights = tf.nn.softmax(self.w)
-        results = (weights[0]*sig + weights[1]*elu + weights[2]*tanh +
-                   weights[3]*relu + weights[4]*silu + weights[5]*gelu +
-                   weights[6]*selu + weights[7]*mish
-                   )
-        return results
-        
-# =============================================================================
-# 2. Recurrent Plasticity Controller: Meta-learning the plasticity rules.
-# =============================================================================
-class RecurrentPlasticityController(tf.keras.layers.Layer):
-    def __init__(self, units=16, **kwargs):
-        super(RecurrentPlasticityController, self).__init__(**kwargs)
-        self.gru = tf.keras.layers.GRU(units, return_sequences=False)
-        self.dense = tf.keras.layers.Dense(2, activation=None)
-
-    def call(self, inputs):
-        # inputs shape: (batch, feature_dim); we add a time dimension.
-        inputs_expanded = tf.expand_dims(inputs, axis=1)  # now (batch, 1, feature_dim)
-        output = self.gru(inputs_expanded)
-        adjustments = self.dense(output)  # produces two values: [delta_add, delta_mult]
-        return adjustments
-        
-class RecurrentPlasticityController(tf.keras.layers.Layer):
-    def __init__(self, units=16, **kwargs):
-        super(RecurrentPlasticityController, self).__init__(**kwargs)
-        self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=units)
-        self.gru = tf.keras.layers.GRU(units, return_sequences=False)
-        self.dense = tf.keras.layers.Dense(2, activation=None)
-        
-    def call(self, inputs):
-        # inputs shape: (batch, feature_dim)
-        attn_input = tf.expand_dims(inputs, axis=1)  # (batch, 1, features)
-        attn_output = self.attention(attn_input, attn_input)
-        gru_output = self.gru(attn_output)
-        adjustments = self.dense(gru_output)
-        return adjustments        
-
-# =============================================================================
-# 3. Unsupervised Feature Extractor: A simple autoencoder for latent representations.
-# =============================================================================
-class UnsupervisedFeatureExtractor(tf.keras.Model):
-    def __init__(self, latent_dim=32, **kwargs):
-        super(UnsupervisedFeatureExtractor, self).__init__(**kwargs)
-        # Encoder: a few Dense layers.
-        self.encoder = tf.keras.Sequential([
-            tf.keras.layers.Flatten(),
-            tf.keras.layers.Dense(latent_dim*8, activation=LearnedActivation()),
-            tf.keras.layers.Dense(latent_dim*4, activation=LearnedActivation()),
-            tf.keras.layers.Dense(latent_dim*2, activation=LearnedActivation()),
-            tf.keras.layers.Dense(latent_dim, activation=LearnedActivation())
-        ])
-        # Decoder: mirror of encoder.
-        self.decoder = tf.keras.Sequential([
-            tf.keras.layers.Dense(latent_dim*2, activation=LearnedActivation()),
-            tf.keras.layers.Dense(latent_dim*4, activation=LearnedActivation()),
-            tf.keras.layers.Dense(latent_dim*8, activation=LearnedActivation()),
-            tf.keras.layers.Dense(10 * 10, activation='sigmoid'),
-            tf.keras.layers.Reshape((10, 10, 1))
-        ])
-        
-    def call(self, x):
-        latent = self.encoder(x)
-        reconstruction = self.decoder(latent)
-        return latent, reconstruction
-
-# =============================================================================
-# 4. Dynamic Connectivity: Using learned activation and unsupervised latent cues.
-# =============================================================================
-class DynamicConnectivity(tf.keras.layers.Layer):
-    def __init__(self, max_units, **kwargs):
-        super(DynamicConnectivity, self).__init__(**kwargs)
-        self.max_units = max_units
-        self.attention_net = tf.keras.Sequential([
-            tf.keras.layers.Dense(32, activation=LearnedActivation()),
-            tf.keras.layers.Dense(max_units, activation='sigmoid')  # Outputs in [0,1]
-        ])
-        
-    def call(self, neuron_features):
-        # neuron_features shape: (batch, max_units)
-        connectivity = self.attention_net(neuron_features)
-        return connectivity
-
-# =============================================================================
-# 5. Dynamic Plastic Dense Layer (Advanced Version 2.0)
-#    Features:
-#      - Uses a mask (of length max_units) that can be updated to prune/grow neurons.
-#      - Uses a recurrent plasticity controller to compute plasticity update rules.
-#      - Incorporates dynamic connectivity modulation.
-# =============================================================================
-class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
-    def __init__(self, max_units, initial_units, plasticity_controller, 
-                 decay_factor=0.9, prune_activation_threshold=0.01, growth_activation_threshold=0.8, **kwargs):
-        """
-        max_units: total candidate neurons.
-        initial_units: neurons active at initialization.
-        plasticity_controller: instance of RecurrentPlasticityController.
-        decay_factor: for homeostatic scaling.
-        prune_activation_threshold: activation below which an active neuron is pruned.
-        growth_activation_threshold: if the mean activation of active neurons exceeds this,
-                                     then an inactive neuron is activated (growth).
-        """
-        super(DynamicPlasticDenseAdvancedHyperV2, self).__init__(**kwargs)
-        self.max_units = max_units
-        self.initial_units = initial_units
-        self.plasticity_controller = plasticity_controller
-        self.decay_factor = decay_factor
-        self.prune_activation_threshold = prune_activation_threshold
-        self.growth_activation_threshold = growth_activation_threshold
-        self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)
-
-        # Plasticity & Homeostasis parameters.
-        self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
-        self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)
-        self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-        self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
-        
-        # For homeostasis.
-        self.target_avg = tf.Variable(0.2, trainable=False, dtype=tf.float32)        
-        
-        # Create a mask for active neurons. 1 means active, 0 inactive.
-        init_mask = [1] * initial_units + [0] * (max_units - initial_units)
-        self.neuron_mask = tf.Variable(init_mask, trainable=False, dtype=tf.float32)
-        
-        # Running average activation (per neuron)
-        self.neuron_activation_avg = tf.Variable(tf.zeros([max_units], dtype=tf.float32),
-                                                 trainable=False)
-        
-    def build(self, input_shape):
-        input_dim = int(input_shape[-1])
-        self.w = self.add_weight(shape=(input_dim, self.max_units),
-                                 initializer='glorot_uniform',
-                                 trainable=True, name='kernel')
-        self.b = self.add_weight(shape=(self.max_units,),
-                                 initializer='zeros',
-                                 trainable=True, name='bias')
-        super(DynamicPlasticDenseAdvancedHyperV2, self).build(input_shape)
-    
-    def call(self, inputs):
-        # Linear combination.
-        z = tf.matmul(inputs, self.w) + self.b  # shape: (batch, max_units)
-        # Compute connectivity modulation based on running activation.
-        connectivity = self.dynamic_connectivity(tf.expand_dims(self.neuron_activation_avg, axis=0))
-        # Multiply with the current neuron mask.
-        mask = tf.expand_dims(self.neuron_mask, axis=0)
-        z_mod = z * connectivity * mask
-        a = LearnedActivation()(z_mod)
-        
-        # Update running average activation.
-        batch_mean = tf.reduce_mean(a, axis=0)
-        alpha = 0.9
-        new_avg = alpha * self.neuron_activation_avg + (1 - alpha) * batch_mean
-        self.neuron_activation_avg.assign(new_avg)
-        
-        return a
-
-    def plasticity_update(self, pre_activity, post_activity, reward):
-        """
-        Compute plasticity update for self.w using the recurrent controller.
-        Instead of a per-connection update, here we compute a global adjustment factor.
-        """
-        # Compute summary statistics.
-        pre_mean = tf.reduce_mean(pre_activity)
-        post_mean = tf.reduce_mean(post_activity)
-        weight_mean = tf.reduce_mean(self.w)
-        # Create a feature vector (batch=1, feature_dim=4).
-        features = tf.reshape(tf.stack([pre_mean, post_mean, weight_mean, tf.cast(reward, tf.float32)]), (1, 4))
-        adjustments = self.plasticity_controller(features)  # shape (1,2)
-        delta_add, delta_mult = adjustments[0, 0], adjustments[0, 1]
-        plasticity_delta = tf.cast(reward, tf.float32) * (delta_add + delta_mult * self.w)
-        return plasticity_delta
-    
-    def apply_plasticity(self, plasticity_delta):
-        self.w.assign_add(plasticity_delta)
-    
-    def apply_homeostatic_scaling(self):
-        avg_w = tf.reduce_mean(tf.abs(self.w))
-        new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
-        scaling_factor = new_target / (avg_w + 1e-6)
-        self.w.assign(self.w * scaling_factor)
-        self.avg_weight_magnitude.assign(avg_w)
-    
-    def apply_structural_plasticity(self):
-        pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
-        self.w.assign(pruned_w)
-        random_matrix = tf.random.uniform(tf.shape(self.w))
-        add_mask = tf.cast(random_matrix < self.add_prob, tf.float32)
-        new_connections = tf.where(tf.logical_and(tf.equal(self.w, 0.0), tf.equal(add_mask, 1.0)),
-                                    tf.random.uniform(tf.shape(self.w), minval=0.01, maxval=0.05),
-                                    self.w)
-        self.w.assign(new_connections)
-        self.sparsity.assign(tf.reduce_mean(tf.cast(tf.equal(self.w, 0.0), tf.float32)))
-        self.adjust_prune_threshold()
-        self.adjust_add_prob()
-
-    def adjust_prune_threshold(self):
-        if self.sparsity > 0.8:
-            self.prune_threshold.assign(self.prune_threshold * 1.05)
-        elif self.sparsity < 0.3:
-            self.prune_threshold.assign(self.prune_threshold * 0.95)
-
-    def adjust_add_prob(self):
-        if self.avg_weight_magnitude < 0.01:
-            self.add_prob.assign(self.add_prob * 1.05)
-        elif self.avg_weight_magnitude > 0.1:
-            self.add_prob.assign(self.add_prob * 0.95)
-    
-    def apply_architecture_modification(self):
-        # Prune: For active neurons, set mask to 0 if their running average activation is below threshold.
-        mask_after_prune = tf.where(
-            tf.logical_and(
-                tf.equal(self.neuron_mask, 1.0),
-                tf.less(self.neuron_activation_avg, self.prune_activation_threshold)
-            ),
-            tf.zeros_like(self.neuron_mask),
-            self.neuron_mask
-        )
-        # Extract activations of the currently active neurons.
-        active_values = tf.boolean_mask(self.neuron_activation_avg, tf.equal(mask_after_prune, 1.0))
-        # Determine if the growth condition is met:
-        # There must be at least one active neuron and their mean activation exceeds the growth threshold.
-        growth_cond = tf.cond(
-            tf.greater(tf.size(active_values), 0),
-            lambda: tf.greater(tf.reduce_mean(active_values), self.growth_activation_threshold),
-            lambda: tf.constant(False)
-        )
-        def grow_neuron():
-            # Find indices of inactive neurons.
-            inactive_indices = tf.squeeze(tf.where(tf.equal(mask_after_prune, 0.0)), axis=1)
-            # If there is at least one inactive neuron, activate one at random.
-            def activate_random():
-                # Shuffle inactive indices and pick the first.
-                random_idx = tf.random.shuffle(inactive_indices)[0]
-                # Update the mask: set the chosen index to 1.
-                new_mask = tf.tensor_scatter_nd_update(
-                    mask_after_prune,
-                    indices=tf.reshape(random_idx, (-1, 1)),
-                    updates=[1.0]
-                )
-                return new_mask
-            # If no inactive neuron is available, return the mask unchanged.
-            new_mask = tf.cond(
-                tf.greater(tf.shape(inactive_indices)[0], 0),
-                activate_random,
-                lambda: mask_after_prune
-            )
-            return new_mask
-        # If growth condition is met, update the mask by growing one neuron.
-        # Otherwise, keep the pruned mask.
-        new_mask = tf.cond(growth_cond, grow_neuron, lambda: mask_after_prune)
-        # Assign the updated mask back to the variable.
-        self.neuron_mask.assign(new_mask)
-        
-        
-# --- Mixture-of-Experts Dynamic Plastic Layer ---
-class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
-    def __init__(self, num_experts, max_units, initial_units, plasticity_controller, **kwargs):
-        super(MoE_DynamicPlasticLayer, self).__init__(**kwargs)
-        self.num_experts = num_experts
-        # Instantiate several experts (each an instance of your existing dynamic plastic dense layer).
-        self.experts = [
-            DynamicPlasticDenseAdvancedHyperV2(max_units, initial_units, plasticity_controller)
-            for _ in range(num_experts)
-        ]
-        # A gating network that assigns a weight to each expert based on the input.
-        self.gating_network = tf.keras.Sequential([
-            tf.keras.layers.Dense(32, activation='relu'),
-            tf.keras.layers.Dense(num_experts, activation='softmax')
-        ])
-
-    def call(self, inputs):
-        # Process the input through each expert.
-        expert_outputs = [expert(inputs) for expert in self.experts]
-        # Stack expert outputs: shape (batch, features, num_experts)
-        expert_stack = tf.stack(expert_outputs, axis=-1)
-        # Get gating weights: shape (batch, num_experts)
-        gate_weights = self.gating_network(inputs)
-        # Expand dims for broadcasting: (batch, 1, num_experts)
-        gate_weights = tf.expand_dims(gate_weights, axis=1)
-        # Compute a weighted sum over experts.
-        output = tf.reduce_sum(expert_stack * gate_weights, axis=-1)
-        return output        
-
-
-# =============================================================================
-# 6. Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer.
-# =============================================================================
-class PlasticityModelMoE(tf.keras.Model):
-    def __init__(self, plasticity_controller, num_experts=2, max_units=128, initial_units=32, num_classes=10, **kwargs):
-        super(PlasticityModelMoE, self).__init__(**kwargs)
-        # Unsupervised branch (autoencoder) remains the same.
-        self.unsupervised_extractor = UnsupervisedFeatureExtractor(latent_dim=32)
-        self.flatten = tf.keras.layers.Flatten()
-        # Replace the single dynamic plastic layer with the MoE version.
-        self.hidden = MoE_DynamicPlasticLayer(num_experts, max_units, initial_units, plasticity_controller)
-        # Main classification head.
-        self.classification_head = tf.keras.layers.Dense(num_classes, activation='softmax')
-        # Additional head for, e.g., uncertainty estimation.
-        self.uncertainty_head = tf.keras.layers.Dense(1, activation='sigmoid')
-
-    def call(self, x, training=False):
-        # Get latent representation and reconstruction.
-        latent, reconstruction = self.unsupervised_extractor(x)
-        x_flat = self.flatten(x)
-        # Process through the MoE dynamic plastic layer.
-        hidden_act = self.hidden(x_flat)
-        # Multihead outputs:
-        class_out = self.classification_head(hidden_act)
-        uncertainty = self.uncertainty_head(hidden_act)
-        # You now have three outputs:
-        #   - class_out: for supervised classification,
-        #   - reconstruction: for unsupervised reconstruction loss,
-        #   - uncertainty: for a side task (or to inform neuromodulation).
-        return class_out, hidden_act, reconstruction, uncertainty
-
-# =============================================================================
-# 7. Training Loop: Incorporates classification loss, unsupervised (reconstruction) loss,
-#    recurrent meta-plasticity updates (with unsupervised influence), chaotic modulation,
-#    and architecture modifications.
-# =============================================================================
-def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=1000,
-                homeostasis_interval=13, architecture_update_interval=21,
-                plasticity_update_interval=8, plasticity_start_epoch=3, experts=2, **kwargs):
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
-    recon_loss_fn = tf.keras.losses.MeanSquaredError()
-    uncertainty_loss_fn = tf.keras.losses.MeanSquaredError()
-    
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
-    
-    # Global variables controlled by the recurrent plasticity controller.
-    global_plasticity_weight_multiplier = tf.Variable(0.5, trainable=False, dtype=tf.float32)
-    global_reward_scaling_factor = tf.Variable(0.1, trainable=False, dtype=tf.float32)
-    
-    train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
-    train_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-    
-    # Metrics for validation, test and autoencoder
-    val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
-    val_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
-    
-    test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
-    test_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
-    
-    train_recon_loss_metric = tf.keras.metrics.Mean(name='train_recon_loss')
-    val_recon_loss_metric = tf.keras.metrics.Mean(name='val_recon_loss')
-    test_recon_loss_metric = tf.keras.metrics.Mean(name='test_recon_loss')    
-    
-    reward = 0.0
-    global_step = 0
-    for epoch in range(num_epochs):
-        train_iter = iter(ds_train)
-        val_iter = iter(ds_val)
-        test_iter = iter(ds_test)
-        batch_errors = []
-        plasticity_weight = 0.0
-        if epoch >= plasticity_start_epoch:
-            plasticity_weight = ((epoch - plasticity_start_epoch + 1) /
-                                 (num_epochs - plasticity_start_epoch + 1))
-            plasticity_weight *= global_plasticity_weight_multiplier.numpy()
-            
-        # Training loop.
-        for step in range(train_steps):
-            images, labels = next(train_iter)        
-            with tf.GradientTape() as tape:
-                predictions, hidden, reconstruction, uncertainty = model(images, training=True)
-                loss = loss_fn(labels, predictions)
-                # Unsupervised reconstruction loss.
-                recon_loss = recon_loss_fn(images, reconstruction)
-                # Target uncertainty is set to 0.5 for all.
-                uncertainty_loss = uncertainty_loss_fn(tf.fill(tf.shape(uncertainty), 0.5), uncertainty)                
-                # Combine losses as needed (weights can be tuned).
-                total_loss = loss + 0.1 * recon_loss + 0.05 * uncertainty_loss                            
-                
-            grads = tape.gradient(total_loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-            
-            batch_errors.append(loss.numpy())
-            train_loss_metric(loss)
-            train_accuracy_metric(labels, predictions)
-            train_recon_loss_metric(recon_loss)
-            
-            # Compute activities for plasticity update.
-            x_flat = model.flatten(images)
-            pre_activity = tf.reduce_mean(x_flat, axis=0)
-            post_activity = tf.reduce_mean(hidden, axis=0)
-            
-            # Update reward: now including unsupervised reconstruction loss.
-            reward = global_reward_scaling_factor.numpy() * \
-                     compute_reinforcement_signals(loss, recon_loss, predictions, hidden, experts, reward)
-            
-            if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
-                chaos_state = chaotic_modulation(0.5)  # starting chaos state (can be updated)
-                neuromod_signal = compute_neuromodulatory_signal(predictions, reward)
-                for expert in model.hidden.experts:
-                    plasticity_delta = expert.plasticity_update(pre_activity, post_activity, reward)
-                    # Modulate the plasticity update.
-                    plasticity_delta *= plasticity_weight * chaos_state * neuromod_signal
-                    # Bound the plasticity delta to prevent erratic behavior.
-                    plasticity_delta = tf.clip_by_norm(plasticity_delta, clip_norm=0.05)
-                    expert.apply_plasticity(plasticity_delta)
-            
-            if global_step % homeostasis_interval == 0:
-                for expert in model.hidden.experts:
-                    expert.apply_homeostatic_scaling()
-                    expert.apply_structural_plasticity()
-                
-            if global_step % architecture_update_interval == 0:
-                for expert in model.hidden.experts:
-                    expert.apply_architecture_modification()
-                
-            global_step += 1
-        
-        # Logging training metrics.
-        mean_error = np.mean(batch_errors)
-        std_error = np.std(batch_errors)
-        print(f"Epoch {epoch+1}/{num_epochs}\n"
-              f"Train Loss : {train_loss_metric.result():.4f}, "
-              f"Train Accuracy : {train_accuracy_metric.result():.4f}, "
-              f"Train Recon Loss : {train_recon_loss_metric.result():.4f}")
-
-        # Reset training metrics.
-        train_loss_metric.reset_state()
-        train_accuracy_metric.reset_state()
-        train_recon_loss_metric.reset_state()
-        
-        # -----------------------
-        # Validation Evaluation.
-        # -----------------------
-        for step in range(val_steps):
-            val_images, val_labels = next(val_iter)         
-            val_predictions, _, val_reconstruction, _ = model(val_images, training=False)
-            val_loss = loss_fn(val_labels, val_predictions)
-            val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
-            
-            val_loss_metric(val_loss)
-            val_accuracy_metric(val_labels, val_predictions)
-            val_recon_loss_metric(val_recon_loss)
-
-        print(f"Val Loss   : {val_loss_metric.result():.4f}, "
-              f"Val Accuracy   : {val_accuracy_metric.result():.4f}, "
-              f"Val Recon Loss : {val_recon_loss_metric.result():.4f}")
-
-        val_loss_metric.reset_state()
-        val_accuracy_metric.reset_state()
-        val_recon_loss_metric.reset_state()
-        
-        # -----------------------
-        # Test Evaluation.
-        # -----------------------
-        for step in range(test_steps):
-            test_images, test_labels = next(test_iter)        
-            test_predictions, _, test_reconstruction, _ = model(test_images, training=False)
-            test_loss = loss_fn(test_labels, test_predictions)
-            test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
-
-            test_loss_metric(test_loss)
-            test_accuracy_metric(test_labels, test_predictions)
-            test_recon_loss_metric(test_recon_loss)
-
-        print(f"Test Loss  : {test_loss_metric.result():.4f}, "
-              f"Test Accuracy  : {test_accuracy_metric.result():.4f}, "
-              f"Test Recon Loss : {test_recon_loss_metric.result():.4f}\n")
-
-        test_loss_metric.reset_state()
-        test_accuracy_metric.reset_state()
-        test_recon_loss_metric.reset_state()
-    
-    model.save("models/MetaSynapse_NextGen_v3.keras")
-
-    
-# =============================================================================
-# 8. Helper functions for chaotic modulation, neuromodulatory signal, and reinforcement signals.
-# =============================================================================
-def chaotic_modulation(c, r=3.8):
-    # Simple logistic map.
-    return r * c * (1 - c)
-    
-def compute_neuromodulatory_signal(predictions, external_reward=0.0):
-    # Use entropy as a proxy for uncertainty.
-    entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
-    modulation = tf.sigmoid(external_reward + tf.reduce_mean(entropy))
-    return modulation
-
-def compute_reinforcement_signals(loss, recon_loss, predictions, hidden, experts=2, external_reward=0.0):
-    """
-    Combines multiple signals into a reinforcement reward:
-      - Loss-based signal: tf.sigmoid(-loss)
-      - Reconstruction signal: 0.5 * tf.sigmoid(-recon_loss)
-      - Novelty signal: 0.5 * tf.sigmoid(std(hidden))
-      - Uncertainty signal: 0.5 * tf.sigmoid(mean(entropy(predictions)))
-      - MoE diversity and attention sharpness
-      - External reward can be added.
-    """
-    novelty = tf.math.reduce_std(hidden)
-    entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
-    avg_uncertainty = tf.reduce_mean(entropy)
-    loss_signal = tf.sigmoid(-loss)
-    recon_signal = 0.5 * tf.sigmoid(-recon_loss)
-    novelty_signal = 0.5 * tf.sigmoid(novelty)
-    uncertainty_signal = 0.5 * tf.sigmoid(avg_uncertainty)
-    combined_reward = loss_signal + recon_signal + novelty_signal + uncertainty_signal + external_reward
-    
-    diversity = tf.math.reduce_std(experts)  # Encourage diverse expert usage
-    attention_sharpness = tf.reduce_mean(tf.nn.softmax(experts, axis=-1))
-    return combined_reward + 0.3 * diversity + 0.2 * attention_sharpness
-    
-
-# =============================================================================
-# 9. Data loading functions.
-# =============================================================================
-def get_real_data(num_samples):
-    dataset = 'Take5'
-    df = pd.read_csv(f'datasets/{dataset}_Full.csv')
-    target_df = df.head(num_samples // 10).copy()
-    cols = ['A', 'B', 'C', 'D', 'E']
-    target_df = target_df[cols].dropna().astype(np.int8)
-    target_df = target_df.map(lambda x: f'{x:02d}')
-    flattened = target_df.values.flatten()
-    full_data = np.array([int(d) for num in flattened for d in str(num)], dtype=np.int8)
-    return full_data
-
-def create_windows(sequence, window_size=65):
-    num_windows = len(sequence) - window_size + 1
-    windows = np.lib.stride_tricks.as_strided(
-        sequence,
-        shape=(num_windows, window_size),
-        strides=(sequence.strides[0], sequence.strides[0])
-    ).copy()
-    inputs = windows[:, :-1]
-    labels = windows[:, -1]
-    return inputs, labels
-
-def split_dataset(inputs, labels, train_frac=0.8, val_frac=0.1):
-    total = inputs.shape[0]
-    train_end = int(total * train_frac)
-    val_end = int(total * (train_frac + val_frac))
-    return (inputs[:train_end], labels[:train_end]), (inputs[train_end:val_end], labels[train_end:val_end]), (inputs[val_end:], labels[val_end:])
-
-def create_tf_dataset(inputs, labels, batch_size=128, shuffle=False, repeat_epochs=1):
-    inputs = inputs.astype(np.float32) / 9.0
-    inputs = inputs.reshape((-1, 10, 10, 1))
-    dataset = tf.data.Dataset.from_tensor_slices((inputs, labels))
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=1000)
-    dataset = dataset.batch(batch_size).repeat().prefetch(tf.data.AUTOTUNE)
-    return dataset
-
-# =============================================================================
-# 10. Main function: Build dataset, instantiate controllers and model, then train.
-# =============================================================================
-def main():
-    batch_size = 100
-    max_units = 128
-    initial_units = 128
-    window_size = 100
-    epochs = 100
-    h = 10
-    w = 10
-    # Load data.
-    sequence = get_real_data(num_samples=10_000)
-    inputs, labels = create_windows(sequence, window_size=window_size+1)
-    (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
-    
-    train_len = inp_train.shape[0]+lbl_train.shape[0]
-    val_len = inp_val.shape[0]+lbl_val.shape[0]
-    test_len = inp_test.shape[0]+lbl_test.shape[0]
-    
-    train_steps = math.ceil((train_len-window_size-1)/batch_size)
-    val_steps = math.ceil((train_len-window_size-1)/batch_size)
-    test_steps = math.ceil((train_len-window_size-1)/batch_size)
-    
-    ds_train = create_tf_dataset(inp_train, lbl_train, batch_size=batch_size, shuffle=False, repeat_epochs=epochs)
-    ds_val = create_tf_dataset(inp_val, lbl_val, batch_size=batch_size, shuffle=False, repeat_epochs=epochs)
-    ds_test = create_tf_dataset(inp_test, lbl_test, batch_size=batch_size, shuffle=False, repeat_epochs=epochs)
-    
-    # Instantiate the recurrent plasticity controller.
-    plasticity_controller = RecurrentPlasticityController(units=32)
-    _ = plasticity_controller(tf.zeros((1,4)))  # Warm up
-    
-    # Instantiate the new MoE-based model.
-    model = PlasticityModelMoE(plasticity_controller, num_experts=2, max_units=max_units, initial_units=initial_units, num_classes=10)
-    dummy_input = tf.zeros((1, 10, 10, 1))
-    _ = model(dummy_input, training=False)
-    model.summary()
-    
-    # Train the model.
-    train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=epochs,
-                homeostasis_interval=100, architecture_update_interval=100,
-                plasticity_update_interval=5, plasticity_start_epoch=5)
-    
-if __name__ == '__main__':
-    main()import tensorflow as tf
 import pandas as pd
 import numpy as np
 import random
@@ -700,27 +78,29 @@ class RecurrentPlasticityController(tf.keras.layers.Layer):
 class UnsupervisedFeatureExtractor(tf.keras.Model):
     def __init__(self, h, w, latent_dim=16, **kwargs):
         super(UnsupervisedFeatureExtractor, self).__init__(**kwargs)
+        self.flat = tf.keras.layers.Flatten() 
         # Encoder: a few Dense layers.
         self.encoder = tf.keras.Sequential([
-            tf.keras.layers.Flatten(),
+            #tf.keras.layers.Flatten(),
+            tf.keras.layers.Dense(latent_dim*16, activation='relu'),
             tf.keras.layers.Dense(latent_dim*8, activation='relu'),
             tf.keras.layers.Dense(latent_dim*4, activation='relu'),
-            tf.keras.layers.Dense(latent_dim*2, activation='relu'),
             tf.keras.layers.Dense(latent_dim, activation='relu')
         ])
         # Decoder: mirror of encoder.
         self.decoder = tf.keras.Sequential([
-            tf.keras.layers.Dense(latent_dim*2, activation='relu'),
             tf.keras.layers.Dense(latent_dim*4, activation='relu'),
             tf.keras.layers.Dense(latent_dim*8, activation='relu'),
-            tf.keras.layers.Dense(h * w, activation='sigmoid'),
-            tf.keras.layers.Reshape((h, w, 1))
+            tf.keras.layers.Dense(latent_dim*16, activation='relu'),
+            tf.keras.layers.Dense(1, activation='sigmoid'),
+            #tf.keras.layers.Reshape((h, w, 1))
         ])
     @tf.function    
     def call(self, x):
         latent = self.encoder(x)
+        flat_latent = self.flat(latent)
         reconstruction = self.decoder(latent)
-        return latent, reconstruction
+        return flat_latent, reconstruction
         
     def compute_output_shape(self, input_shape):
         return input_shape        
@@ -982,29 +362,34 @@ class EpisodicMemory(tf.keras.layers.Layer):
             name='episodic_memory'
         )
         self.write_layer = tf.keras.layers.Dense(self.memory_dim, activation='tanh')
-        self.read_layer = tf.keras.layers.Dense(self.memory_dim, activation='softmax')
+        # Output a weighting over memory slots.
+        self.read_layer = tf.keras.layers.Dense(self.memory_size, activation='softmax')
         super(EpisodicMemory, self).build(input_shape)
 
     @tf.function
     def call(self, inputs):
-        # Read: Compute attention over memory based on inputs.
-        attention = self.read_layer(inputs)  # (batch, memory_dim)
+        # Read: Compute attention weights over memory slots.
+        attention = self.read_layer(inputs)  # Expected shape: (batch, memory_size)
         read_vector = tf.matmul(tf.expand_dims(attention, 1), self.memory)
-        read_vector = tf.squeeze(read_vector, axis=1)
-        # Write: Update a random memory slot with a transformed input.
-        write_vector = self.write_layer(inputs)
+        read_vector = tf.squeeze(read_vector, axis=1)  # Now shape: (batch, memory_dim)
+        
+        # Write: Compute write vectors from the inputs.
+        write_vector = self.write_layer(inputs)  # Shape: (batch, memory_dim)
+        # Aggregate the batch into one vector.
+        aggregated_write_vector = tf.reduce_mean(write_vector, axis=0)  # Shape: (memory_dim,)
+        
+        # Update a random memory slot with the aggregated write vector.
         idx = tf.random.uniform(shape=[], maxval=self.memory_size, dtype=tf.int32)
-        memory_update = tf.tensor_scatter_nd_update(self.memory, [[idx]], [write_vector])
+        memory_update = tf.tensor_scatter_nd_update(self.memory, [[idx]], [aggregated_write_vector])
         self.memory.assign(memory_update)
         return read_vector
-        
 
 # =============================================================================
 # 7. Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer.
 # =============================================================================
 class PlasticityModelMoE(tf.keras.Model):
     def __init__(self, h, w, plasticity_controller, num_experts=2, max_units=128, 
-                 initial_units=32, num_classes=10, memory_size=100, memory_dim=16, **kwargs):
+                 initial_units=32, num_classes=10, memory_size=512, memory_dim=32, **kwargs):
         super(PlasticityModelMoE, self).__init__(**kwargs)
         self.unsupervised_extractor = UnsupervisedFeatureExtractor(h, w)
         self.flatten = tf.keras.layers.Flatten()
@@ -1026,7 +411,6 @@ class PlasticityModelMoE(tf.keras.Model):
         class_out = self.classification_head(combined)
         uncertainty = self.uncertainty_head(combined)
         return class_out, hidden_act, reconstruction, uncertainty, latent
-
 
 # =============================================================================
 # 8. Training Loop: Incorporates classification loss, unsupervised (reconstruction) loss,
@@ -1218,8 +602,8 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                 if best_weights is not None:
                     print("Restoring best weights and saving model.\n")
                     model.set_weights(best_weights)
-                    model.save("models/MetaSynapse_NextGen_v3e.keras")
-                    model.unsupervised_extractor.save("models/unsupervised_extractor_v3e.keras")
+                    model.save("models/MetaSynapse_NextGen_v5.keras")
+                    model.unsupervised_extractor.save("models/unsupervised_extractor_v5.keras")
                     patience_counter = 0
                 #break  # Exit the epoch loop.
 
@@ -1319,12 +703,12 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # =============================================================================
 def main():
     batch_size = 128
-    max_units = 256
-    initial_units = 128
+    max_units = 64
+    initial_units = 16
     epochs = 1000
-    experts = 32
-    h = 8
-    w = 8
+    experts = 8
+    h = 16
+    w = 16
     window_size = h*w
     learning_rate=1e-4
     
@@ -1361,8 +745,8 @@ def main():
         
     # Train the model.
     train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=epochs,
-                homeostasis_interval=5, architecture_update_interval=21,
-                plasticity_update_interval=3, plasticity_start_epoch=1, learning_rate=learning_rate)
+                homeostasis_interval=8, architecture_update_interval=21,
+                plasticity_update_interval=5, plasticity_start_epoch=3, learning_rate=learning_rate)
     
 if __name__ == '__main__':
     main()
