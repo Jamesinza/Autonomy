@@ -116,6 +116,12 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.prune_activation_threshold = prune_activation_threshold
         self.growth_activation_threshold = growth_activation_threshold
         self.dynamic_connectivity = DynamicConnectivity(max_units=self.max_units)
+
+        # Plasticity & Homeostasis parameters.
+        self.prune_threshold = tf.Variable(0.01, trainable=False, dtype=tf.float32)
+        self.add_prob = tf.Variable(0.01, trainable=False, dtype=tf.float32)
+        self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
         
         # For homeostasis.
         self.target_avg = tf.Variable(0.2, trainable=False, dtype=tf.float32)        
@@ -183,9 +189,29 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.avg_weight_magnitude.assign(avg_w)
     
     def apply_structural_plasticity(self):
-        # Zero out weights that are very small.
-        pruned_w = tf.where(tf.abs(self.w) < 0.01, tf.zeros_like(self.w), self.w)
+        pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
         self.w.assign(pruned_w)
+        random_matrix = tf.random.uniform(tf.shape(self.w))
+        add_mask = tf.cast(random_matrix < self.add_prob, tf.float32)
+        new_connections = tf.where(tf.logical_and(tf.equal(self.w, 0.0), tf.equal(add_mask, 1.0)),
+                                    tf.random.uniform(tf.shape(self.w), minval=0.01, maxval=0.05),
+                                    self.w)
+        self.w.assign(new_connections)
+        self.sparsity.assign(tf.reduce_mean(tf.cast(tf.equal(self.w, 0.0), tf.float32)))
+        self.adjust_prune_threshold()
+        self.adjust_add_prob()
+
+    def adjust_prune_threshold(self):
+        if self.sparsity > 0.8:
+            self.prune_threshold.assign(self.prune_threshold * 1.05)
+        elif self.sparsity < 0.3:
+            self.prune_threshold.assign(self.prune_threshold * 0.95)
+
+    def adjust_add_prob(self):
+        if self.avg_weight_magnitude < 0.01:
+            self.add_prob.assign(self.add_prob * 1.05)
+        elif self.avg_weight_magnitude > 0.1:
+            self.add_prob.assign(self.add_prob * 0.95)
     
     def apply_architecture_modification(self):
         """
@@ -308,10 +334,10 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
         # Logging training metrics.
         mean_error = np.mean(batch_errors)
         std_error = np.std(batch_errors)
-        print(f"Epoch {epoch+1}/{num_epochs} - "
-              f"Train Loss: {train_loss_metric.result():.4f}, "
-              f"Train Accuracy: {train_accuracy_metric.result():.4f}, "
-              f"Mean Error: {mean_error:.4f}, Std Error: {std_error:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}\n"
+              f"Train Loss : {train_loss_metric.result():.4f}, "
+              f"Train Accuracy : {train_accuracy_metric.result():.4f}, "
+              )
         
         # Reset training metrics.
         train_loss_metric.reset_state()
@@ -326,8 +352,8 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
             val_loss_metric(val_loss)
             val_accuracy_metric(val_labels, val_predictions)
         
-        print(f"Validation - Loss: {val_loss_metric.result():.4f}, "
-              f"Accuracy: {val_accuracy_metric.result():.4f}")
+        print(f"Val Loss   : {val_loss_metric.result():.4f}, "
+              f"Val Accuracy   : {val_accuracy_metric.result():.4f}")
         val_loss_metric.reset_state()
         val_accuracy_metric.reset_state()
         
@@ -340,12 +366,12 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
             test_loss_metric(test_loss)
             test_accuracy_metric(test_labels, test_predictions)
             
-        print(f"Test - Loss: {test_loss_metric.result():.4f}, "
-              f"Accuracy: {test_accuracy_metric.result():.4f}\n")
+        print(f"Test Loss  : {test_loss_metric.result():.4f}, "
+              f"Test Accuracy  : {test_accuracy_metric.result():.4f}\n")
         test_loss_metric.reset_state()
         test_accuracy_metric.reset_state()
     
-    model.save("models/MetaSynapse_NextGen_v1.keras")
+    model.save("models/MetaSynapse_NextGen_v2.keras")
 
     
 # =============================================================================
@@ -458,4 +484,3 @@ def main():
     
 if __name__ == '__main__':
     main()
-
