@@ -200,7 +200,7 @@ def get_real_data(num_samples):
     target_df = df.head(num_samples // 10).copy()
     cols = ['A', 'B', 'C', 'D', 'E']
     target_df = target_df[cols].dropna().astype(np.int8)
-    target_df = target_df.applymap(lambda x: f'{x:02d}')
+    target_df = target_df.map(lambda x: f'{x:02d}')
     flattened = target_df.values.flatten()
     full_data = np.array([int(d) for num in flattened for d in str(num)], dtype=np.int8)
     return full_data
@@ -243,45 +243,51 @@ def compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0
       - Uncertainty signal: average entropy of predictions.
       - External reward can be added.
     """
-    # Novelty measure: higher std in hidden activations indicates novelty.
     novelty = tf.math.reduce_std(hidden)
-    
-    # Uncertainty: compute softmax entropy of predictions.
     entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
     avg_uncertainty = tf.reduce_mean(entropy)
-    
-    # Combine signals with tunable weights.
     loss_signal = tf.sigmoid(-loss)
     novelty_signal = 0.5 * tf.sigmoid(novelty)
     uncertainty_signal = 0.5 * tf.sigmoid(avg_uncertainty)
-    
-    # Combined reward signal.
     combined_reward = loss_signal + novelty_signal + uncertainty_signal + external_reward
     return combined_reward
 
 # -----------------------------------------------------------------------------
-# 7. Training loop with hypernetwork, architecture modification, and integrated reinforcement signals.
+# 7. MetaPlasticityController: Nested meta-controller for hyperparameter tuning.
 # -----------------------------------------------------------------------------
-def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
+class MetaPlasticityController(tf.keras.layers.Layer):
+    def __init__(self, hidden_units=16, **kwargs):
+        super(MetaPlasticityController, self).__init__(**kwargs)
+        self.dense1 = tf.keras.layers.Dense(hidden_units, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(hidden_units, activation='relu')
+        # Output adjustments for [plasticity_multiplier_delta, reward_scaling_delta]
+        self.out = tf.keras.layers.Dense(2, activation='tanh')  # tanh to bound adjustments
+
+    def call(self, inputs):
+        # inputs: a vector with [mean_error, std_error, current_multiplier, current_reward_scaling]
+        x = self.dense1(inputs)
+        x = self.dense2(x)
+        adjustments = self.out(x)
+        return adjustments
+
+# -----------------------------------------------------------------------------
+# 8. Training loop with nested meta-plasticity.
+# -----------------------------------------------------------------------------
+def train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=1000,
                 homeostasis_interval=100, architecture_update_interval=100,
                 plasticity_start_epoch=3, plasticity_update_interval=10):
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
     
-    # Initialize plasticity weight and reward scaling.
-    global_plasticity_weight_multiplier = 0.5
-    global_reward_scaling_factor = 0.1
+    # Initialize plasticity weight and reward scaling (now controlled by meta_controller).
+    global_plasticity_weight_multiplier = tf.Variable(0.5, trainable=False, dtype=tf.float32)
+    global_reward_scaling_factor = tf.Variable(0.1, trainable=False, dtype=tf.float32)
 
     # Define optimal target values for mean and std of plasticity delta.
     MEAN_MIN, MEAN_MAX = 1e-4, 1e-3
     STD_MIN, STD_MAX = 5e-4, 1e-2
     OPTIMAL_MEAN = (MEAN_MIN + MEAN_MAX) / 2
     OPTIMAL_STD = (STD_MIN + STD_MAX) / 2
-
-    # Dynamic adjustment speed settings.
-    ADJUSTMENT_SPEED = 0.2
-    ADJUSTMENT_SPEED_MIN, ADJUSTMENT_SPEED_MAX = 0.05, 0.5
-    rolling_variance = collections.deque(maxlen=10)
 
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
@@ -290,7 +296,7 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
     for epoch in range(num_epochs):
         plasticity_weight = ((epoch - plasticity_start_epoch + 1) / 
                              (num_epochs - plasticity_start_epoch + 1)) if epoch >= plasticity_start_epoch else 0.0
-        plasticity_weight *= global_plasticity_weight_multiplier
+        plasticity_weight *= global_plasticity_weight_multiplier.numpy()  # use current multiplier
 
         for images, labels in ds_train:
             with tf.GradientTape() as tape:
@@ -306,8 +312,8 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
             pre_activity = tf.reduce_mean(x_flat, axis=0)
             post_activity = tf.reduce_mean(hidden, axis=0)
             
-            # Compute combined reward using loss, novelty, and uncertainty signals.
-            reward = global_reward_scaling_factor * compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0)
+            # Compute combined reward.
+            reward = global_reward_scaling_factor.numpy() * compute_reinforcement_signals(loss, predictions, hidden, external_reward=0.0)
             
             if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
                 plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
@@ -318,28 +324,26 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
                 delta_mean = tf.reduce_mean(tf.abs(plasticity_delta))
                 delta_std = tf.math.reduce_std(plasticity_delta)
 
-                # Compute deviation from optimal values.
+                # Calculate errors with respect to optimal values.
                 mean_error = delta_mean - OPTIMAL_MEAN
                 std_error = delta_std - OPTIMAL_STD
 
-                # Adjust plasticity weight and reward scaling.
-                global_plasticity_weight_multiplier *= (1 + ADJUSTMENT_SPEED * mean_error / OPTIMAL_MEAN)
-                global_reward_scaling_factor *= (1 + ADJUSTMENT_SPEED * std_error / OPTIMAL_STD)
+                # Use the meta controller to get adjustments.
+                meta_input = tf.convert_to_tensor([[mean_error, std_error,
+                                                     global_plasticity_weight_multiplier.numpy(),
+                                                     global_reward_scaling_factor.numpy()]], dtype=tf.float32)
+                adjustments = meta_controller(meta_input)
+                # adjustments are in [-1,1]; we scale them to a small update
+                adjust_factor = 0.05
+                new_multiplier = global_plasticity_weight_multiplier * (1.0 + adjust_factor * adjustments[0, 0])
+                new_reward_scaling = global_reward_scaling_factor * (1.0 + adjust_factor * adjustments[0, 1])
                 
-                # Adjust the adjustment speed based on recent update variance.
-                rolling_variance.append(tf.abs(mean_error) + tf.abs(std_error))
-                if len(rolling_variance) == rolling_variance.maxlen:
-                    variance_level = tf.math.reduce_std(
-                        [rolling_variance[i].numpy() for i in range(len(rolling_variance))]
-                    ).numpy()
-                    
-                    if variance_level < 0.1:
-                        ADJUSTMENT_SPEED = min(ADJUSTMENT_SPEED * 1.1, ADJUSTMENT_SPEED_MAX)
-                    elif variance_level > 0.5:
-                        ADJUSTMENT_SPEED = max(ADJUSTMENT_SPEED * 0.9, ADJUSTMENT_SPEED_MIN)
+                # Clamp the values to reasonable ranges.
+                new_multiplier = tf.clip_by_value(new_multiplier, 0.01, 5.0)
+                new_reward_scaling = tf.clip_by_value(new_reward_scaling, 0.01, 5.0)
                 
-                global_plasticity_weight_multiplier = max(0.01, min(global_plasticity_weight_multiplier, 5.0))
-                global_reward_scaling_factor = max(0.01, min(global_reward_scaling_factor, 5.0))
+                global_plasticity_weight_multiplier.assign(new_multiplier)
+                global_reward_scaling_factor.assign(new_reward_scaling)
             
             if global_step % homeostasis_interval == 0:
                 model.hidden.apply_homeostatic_scaling()
@@ -375,15 +379,15 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
             test_accuracy_metric(labels, predictions)
         print(f"Test Loss: {test_loss_metric.result():.4f}, Test Accuracy: {test_accuracy_metric.result():.4f}")
     
-    model.save("models/MetaSynapse_v9.keras")
+    model.save("models/MetaSynapse_vNested.keras")
 
 # -----------------------------------------------------------------------------
-# 8. Main: Create dataset, instantiate models, and train.
+# 9. Main: Create dataset, instantiate models, and train.
 # -----------------------------------------------------------------------------
 def main():
     batch_size = 128
-    max_units = 256
-    initial_units = 128
+    max_units = 512
+    initial_units = 16
     # Load sequence data.
     sequence = get_real_data(num_samples=100_000)
     inputs, labels = create_windows(sequence, window_size=65)
@@ -395,8 +399,13 @@ def main():
     
     # Instantiate the hypernetwork.
     dummy_input = tf.zeros((1, 4))
-    dynamic_hypernet = DynamicPlasticityHypernetwork(hidden_units=32)
+    dynamic_hypernet = DynamicPlasticityHypernetwork(hidden_units=16)
     _ = dynamic_hypernet(dummy_input)
+    
+    # Instantiate the meta plasticity controller.
+    meta_controller = MetaPlasticityController(hidden_units=16)
+    dummy_meta = tf.zeros((1, 4))
+    _ = meta_controller(dummy_meta)
     
     # Instantiate the model with the hypernetwork integrated.
     model = PlasticityModelHyper(hypernetwork=dynamic_hypernet, max_units=max_units,
@@ -408,7 +417,7 @@ def main():
     model.summary()
     
     # Train the model.
-    train_model(model, ds_train, ds_val, ds_test, num_epochs=1000,
+    train_model(model, meta_controller, ds_train, ds_val, ds_test, num_epochs=1000,
                 homeostasis_interval=100, architecture_update_interval=100)
 
 if __name__ == '__main__':
