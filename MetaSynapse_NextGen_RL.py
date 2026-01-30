@@ -312,6 +312,19 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
             tf.keras.layers.Dense(self.num_experts, activation='softmax', name='moe_dens2')
         ])
 
+    def build(self, input_shape):
+        self.clip1 = self.add_weight(
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.05),
+            trainable=True,
+            name='clip1_norm')
+        self.clip2 = self.add_weight(
+            shape=(),
+            initializer=tf.keras.initializers.Constant(0.05),
+            trainable=True,
+            name='clip2_norm')        
+        super(MoE_DynamicPlasticLayer, self).build(input_shape)         
+
     def call(self, inputs, latent=None):
         # Compute expert outputs in parallel.
         expert_outputs = [expert(inputs) for expert in self.experts]
@@ -339,8 +352,8 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         delta_delays = (self.neural_ode_plasticity(expert_delays, context=neuromod_signal) * gating_signal *
                         tf.cast(reward, tf.float32) * (update_gate * (scale_factor + bias_adjustment * expert_delays)))
         # Clip updates.
-        delta_ws = tf.clip_by_norm(delta_ws, clip_norm=0.05, axes=[1,2,3])
-        delta_delays = tf.clip_by_norm(delta_delays, clip_norm=0.05, axes=[1,2,3])
+        delta_ws = tf.clip_by_norm(delta_ws, clip_norm=self.clip1, axes=[1,2,3])
+        delta_delays = tf.clip_by_norm(delta_delays, clip_norm=self.clip2, axes=[1,2,3])
         # Update experts' weights vectorized.
         new_expert_ws = expert_ws + delta_ws  # * neuromod_signal
         new_expert_delays = expert_delays + delta_delays  # * neuromod_signal
@@ -465,44 +478,6 @@ class NeuralODEPlasticity(tf.keras.layers.Layer):
         # Reshape y back to the original state shape.
         new_state = tf.reshape(y, orig_shape)
         return new_state
-
-# ====================================================
-# Recurrent Plasticity Controller with Self-Attention
-# ====================================================
-class RecurrentPlasticityController(tf.keras.layers.Layer):
-    def __init__(self, units=256, sequence_length=64, use_attention=True, **kwargs):
-        super(RecurrentPlasticityController, self).__init__(**kwargs)
-        self.sequence_length = sequence_length
-        self.units = units
-        self.use_attention = use_attention
-        self.act = LearnedQuantumActivation()
-        # Optionally include self-attention.
-        if self.use_attention:
-            self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=self.units)
-        # A GRU to process the sequence.
-        self.gru = tf.keras.layers.GRU(self.units, return_sequences=False)
-        # Final dense layer producing two output scalars.
-        self.dense = tf.keras.layers.Dense(2, activation=self.act, name='rpc_dens')
-
-    def build(self, input_shape):
-        # No additional weights needed.
-        super(RecurrentPlasticityController, self).build(input_shape)
-
-    def call(self, input_sequence):
-        # If attention is used, apply it.
-        if self.use_attention:
-            # Self-attention: using the sequence as both query and key.
-            attn_output = self.attention(input_sequence, input_sequence)
-        else:
-            attn_output = input_sequence  # Skip attention.
-        # Process the (possibly attended) sequence with GRU.
-        x = self.gru(attn_output)
-        adjustments = self.dense(x)  # Shape: (batch, 2)
-        return adjustments
-
-    def compute_output_shape(self, input_shape):
-        # Regardless of input, output is (batch, 2)
-        return (input_shape[0], 2)
 
 # ====================== Quantum Inspired Control Mechanisms Section =======================
 
@@ -847,17 +822,17 @@ class UnsupervisedFeatureExtractor(tf.keras.Model):
         super(UnsupervisedFeatureExtractor, self).__init__(**kwargs)
         self.units = units
         # Encoder layers
-        self.enc_cnn1 = tf.keras.layers.Conv2D(self.units, (3, 3), activation="relu", padding="same", name="enc_cnn1")
-        self.enc_pool1 = tf.keras.layers.MaxPooling2D((2, 2), padding="same", name="enc_pool1")
-        self.enc_cnn2 = tf.keras.layers.Conv2D(self.units*2, (3, 3), activation="relu", padding="same", name="enc_cnn2")
-        self.enc_pool2 = tf.keras.layers.MaxPooling2D((2, 2), padding="same", name="enc_pool2")
-        self.enc_latent = tf.keras.layers.Conv2D(self.units*4, (3, 3), activation="relu", padding="same", name="enc_latent")
-        self.global_avg_pool = tf.keras.layers.GlobalAveragePooling2D(name="global_avg_pool")
+        self.enc_cnn1 = tf.keras.layers.Conv1D(self.units, 3, activation="relu", padding="same", name="enc_cnn1")
+        self.enc_pool1 = tf.keras.layers.MaxPooling1D(2, padding="same", name="enc_pool1")
+        self.enc_cnn2 = tf.keras.layers.Conv1D(self.units*2, 3, activation="relu", padding="same", name="enc_cnn2")
+        self.enc_pool2 = tf.keras.layers.MaxPooling1D(2, padding="same", name="enc_pool2")
+        self.enc_latent = tf.keras.layers.Conv1D(self.units*4, 3, activation="relu", padding="same", name="enc_latent")
+        self.global_avg_pool = tf.keras.layers.GlobalAveragePooling1D(name="global_avg_pool")
         # Decoder layers
-        self.dec_upconv1 = tf.keras.layers.Conv2DTranspose(self.units*2, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv1")
+        self.dec_upconv1 = tf.keras.layers.Conv1DTranspose(self.units*2, 3, strides=2, activation="relu", padding="same", name="dec_upconv1")
         self.dec_concat1 = tf.keras.layers.Concatenate(name="dec_concat1")
-        self.dec_upconv2 = tf.keras.layers.Conv2DTranspose(self.units, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv2")
-        self.dec_output = tf.keras.layers.Conv2D(1, (3, 3), activation="sigmoid", padding="same", name="dec_output")        
+        self.dec_upconv2 = tf.keras.layers.Conv1DTranspose(self.units, 3, strides=2, activation="relu", padding="same", name="dec_upconv2")
+        self.dec_output = tf.keras.layers.Conv1D(8, 3, activation="sigmoid", padding="same", name="dec_output")        
 
     def build(self, input_shape):
         super(UnsupervisedFeatureExtractor, self).build(input_shape)        
@@ -893,6 +868,10 @@ class EpisodicMemory(tf.keras.layers.Layer):
         super(EpisodicMemory, self).__init__(**kwargs)
         self.memory_size = memory_size
         self.memory_dim = memory_dim
+        # A dense layer to generate candidate write vectors.
+        self.write_layer = tf.keras.layers.Dense(self.memory_dim, activation='tanh', name='em_write')
+        # A dense layer to compute attention weights for memory updates.
+        self.attention_layer = tf.keras.layers.Dense(self.memory_size, activation='softmax', name='em_attention')        
 
     def build(self, input_shape):
         # Initialize memory matrix; non-trainable but updated differentiably.
@@ -902,10 +881,6 @@ class EpisodicMemory(tf.keras.layers.Layer):
             trainable=False,
             name='episodic_memory'
         )
-        # A dense layer to generate candidate write vectors.
-        self.write_layer = tf.keras.layers.Dense(self.memory_dim, activation='tanh', name='em_write')
-        # A dense layer to compute attention weights for memory updates.
-        self.attention_layer = tf.keras.layers.Dense(self.memory_size, activation='softmax', name='em_attention')
         # A learned update gate for memory blending.
         self.update_gate = self.add_weight(
             shape=(self.memory_size,),
@@ -952,11 +927,11 @@ class PlasticityModelMoE(tf.keras.Model):
         self.memory_dim = memory_dim
         self.act = LearnedQuantumActivation()
         # Classic CNN based network layers
-        self.cnn1 = tf.keras.layers.Conv2D(units//4, (3,3), activation='relu', padding='same')
-        self.cnn2 = tf.keras.layers.Conv2D(units//2, (3,3), activation='relu', padding='same')
-        self.cnn3 = tf.keras.layers.Conv2D(units, (3,3), activation='relu', padding='same')
+        self.cnn1 = tf.keras.layers.Conv1D(units//4, 3, activation='relu', padding='same')
+        self.cnn2 = tf.keras.layers.Conv1D(units//2, 3, activation='relu', padding='same')
+        self.cnn3 = tf.keras.layers.Conv1D(units, 3, activation='relu', padding='same')
         self.drop = tf.keras.layers.Dropout(0.0)
-        self.flatten = tf.keras.layers.GlobalAveragePooling2D()
+        self.flatten = tf.keras.layers.GlobalAveragePooling1D()
         self.dens = tf.keras.layers.Dense(units, activation='relu', name='pm_dens1')
         self.classification_head = tf.keras.layers.Dense(self.num_classes, activation='softmax', name='pm_dens2')
         # Instantiate the quantum inspired layers.
@@ -1037,9 +1012,94 @@ class PlasticityModelMoE(tf.keras.Model):
         # Most of these return values are for feedback purposes.
         return class_out, combined_input, hidden_act, reconstruction, uncertainty, latent, quantum_entropy, gate_probs, projected_memory, gating_signal, alignment_score 
 
-# =========================================
-# Helper Functions for Signals and Rewards
-# =========================================
+# =================
+# Helper Functions
+# =================
+# Integrated training step: one forward/backward pass for both model and critic.
+@tf.function
+def train_step(model, loss_fn, recon_loss_fn, optimizer, ae_optimizer,
+               critic_optimizer, images, labels, plasticity_weight_val):
+    with tf.GradientTape(persistent=True) as tape:
+        # Forward pass through the base model.
+        (predictions, combined_input, hidden, reconstruction, uncertainty,
+         latent, quantum_entropy, gate_probs, episodic_memory,
+         gating_signal, alignment_score) = model(images, training=True)
+        
+        # Compute main losses.
+        loss_value = loss_fn(labels, predictions)
+        recon_loss = recon_loss_fn(images, reconstruction)
+        mean_uncertainty = tf.reduce_mean(uncertainty)
+        uncertainty_loss = tf.reduce_mean(tf.square(uncertainty - mean_uncertainty))
+
+    # Update the base model.
+    model_grads = tape.gradient(loss_value, model.trainable_variables)
+    optimizer.apply_gradients(zip(model_grads, model.trainable_variables))
+    # Update autoencoder.
+    ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
+    ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))  
+    # # Update the critic network.
+    critic_grads = tape.gradient(alignment_score, model.critic.trainable_variables)
+    critic_optimizer.apply_gradients(zip(critic_grads, model.critic.trainable_variables))
+    del tape
+    return (loss_value, recon_loss, predictions, combined_input,
+            hidden, latent, quantum_entropy, gate_probs, episodic_memory, gating_signal, alignment_score)
+
+@tf.function
+def val_step(model, loss_fn, recon_loss_fn, val_loss_metric, val_accuracy_metric,
+             val_recon_loss_metric, val_iter, val_steps):
+    for step in range(val_steps):
+        val_images, val_labels = next(val_iter)
+        val_predictions, _, _, val_reconstruction, _, _, _, _, _, _, _ = model(val_images, training=False)
+        val_loss = loss_fn(val_labels, val_predictions)
+        val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
+        val_loss_metric.update_state(val_loss)
+        val_accuracy_metric.update_state(val_labels, val_predictions)
+        val_recon_loss_metric.update_state(val_recon_loss)        
+
+@tf.function
+def test_step(model, loss_fn, recon_loss_fn, test_loss_metric, test_accuracy_metric,
+              test_recon_loss_metric, test_iter, test_steps):
+    for step in range(test_steps):
+        test_images, test_labels = next(test_iter)
+        test_predictions, _, _, test_reconstruction, _, _, _, _, _, _, _ = model(test_images, training=False)
+        test_loss = loss_fn(test_labels, test_predictions)
+        test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
+        test_loss_metric.update_state(test_loss)
+        test_accuracy_metric.update_state(test_labels, test_predictions)
+        test_recon_loss_metric.update_state(test_recon_loss)
+
+@tf.function
+def compute_reinforcement_signals(model, combined_input, hidden, quantum_entropy, loss_value,
+                                  recon_loss, global_reward_scaling_factor):
+    pre_activity = tf.reduce_mean(combined_input, axis=0)
+    post_activity = tf.reduce_mean(hidden, axis=0)
+    novelty = tf.math.reduce_std(hidden)
+    avg_uncertainty = tf.reduce_mean(quantum_entropy)
+    combined_reward = model.reinforcement_layer(loss_value, recon_loss, novelty, avg_uncertainty)
+    reward = combined_reward * global_reward_scaling_factor
+    return reward, pre_activity, post_activity
+
+@tf.function
+def scheduled_plasticity_updates(model, global_plasticity_weight_multiplier, global_reward_scaling_factor,
+                                 pre_activity, post_activity, gating_signal, reward, neuromod_signal):
+    chaotic_factor = model.chaotic_modulator(global_plasticity_weight_multiplier.numpy())
+    global_plasticity_weight_multiplier.assign(chaotic_factor)
+    global_reward_scaling_factor.assign(chaotic_factor)
+    # Create a plasticity feature vector for meta plasticity controller.
+    all_ws = tf.stack([tf.convert_to_tensor(expert.w) for expert in model.hidden.experts], axis=0) # Shape: (num_experts, ...)
+    avg_weight = tf.reduce_mean(tf.abs(all_ws))
+    plasticity_features = tf.stack([tf.reduce_mean(pre_activity),
+                                    tf.reduce_mean(post_activity),
+                                    avg_weight], axis=0)
+    plasticity_features = tf.expand_dims(plasticity_features, axis=0)  # shape: (1,3)
+    scale_factor, bias_adjustment, update_gate = model.meta_plasticity_controller(plasticity_features)
+    gate_modulation = tf.reduce_mean(gating_signal)
+    # Apply the batched plasticity update across all experts.
+    delta_ws, delta_delays = model.hidden.batch_plasticity_update(pre_activity, post_activity, reward,
+                                                                   neuromod_signal,
+                                                                   scale_factor, bias_adjustment, update_gate, gate_modulation)
+    return delta_ws, delta_delays
+
 @tf.function
 def compute_neuromodulatory_signal(predictions, external_reward=0.0):
     # Force computations to float32.
@@ -1083,6 +1143,8 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
     ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
     critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
+
+    # Set up loss functions
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     recon_loss_fn = tf.keras.losses.Huber()
 
@@ -1096,7 +1158,6 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     train_recon_loss_metric = tf.keras.metrics.Mean(name='train_recon_loss')
     val_recon_loss_metric = tf.keras.metrics.Mean(name='val_recon_loss')
     test_recon_loss_metric = tf.keras.metrics.Mean(name='test_recon_loss')
-    # Additional metrics for critic monitoring.
     mean_alignment_metric = tf.keras.metrics.Mean(name="mean_alignment_score")
     mean_gating_metric = tf.keras.metrics.Mean(name="mean_gating_signal")
 
@@ -1110,57 +1171,6 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     recon_patience_counter = 10
     best_weights = None
     recon_best_weights = None
-
-    # Integrated training step: one forward/backward pass for both model and critic.
-    @tf.function
-    def train_step(images, labels, plasticity_weight_val):
-        with tf.GradientTape(persistent=True) as tape:
-            # Forward pass through the base model.
-            (predictions, combined_input, hidden, reconstruction, uncertainty,
-             latent, quantum_entropy, gate_probs, episodic_memory,
-             gating_signal, alignment_score) = model(images, training=True)
-            
-            # Compute main losses.
-            loss_value = loss_fn(labels, predictions)
-            recon_loss = recon_loss_fn(images, reconstruction)
-            mean_uncertainty = tf.reduce_mean(uncertainty)
-            uncertainty_loss = tf.reduce_mean(tf.square(uncertainty - mean_uncertainty))
-
-        # Update the base model.
-        model_grads = tape.gradient(loss_value, model.trainable_variables)
-        optimizer.apply_gradients(zip(model_grads, model.trainable_variables))
-        # Update autoencoder.
-        ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
-        ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))  
-        # # Update the critic network.
-        critic_grads = tape.gradient(alignment_score, model.critic.trainable_variables)
-        critic_optimizer.apply_gradients(zip(critic_grads, model.critic.trainable_variables))
-        del tape
-
-        return (loss_value, recon_loss, predictions, combined_input,
-                hidden, latent, quantum_entropy, gate_probs, episodic_memory, gating_signal, alignment_score)
-
-    @tf.function
-    def val_step(val_iter, val_steps):
-        for step in range(val_steps):
-            val_images, val_labels = next(val_iter)
-            val_predictions, _, _, val_reconstruction, _, _, _, _, _, _, _ = model(val_images, training=False)
-            val_loss = loss_fn(val_labels, val_predictions)
-            val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
-            val_loss_metric.update_state(val_loss)
-            val_accuracy_metric.update_state(val_labels, val_predictions)
-            val_recon_loss_metric.update_state(val_recon_loss)        
-
-    @tf.function
-    def test_step(test_iter, teststeps):
-        for step in range(test_steps):
-            test_images, test_labels = next(test_iter)
-            test_predictions, _, _, test_reconstruction, _, _, _, _, _, _, _ = model(test_images, training=False)
-            test_loss = loss_fn(test_labels, test_predictions)
-            test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
-            test_loss_metric.update_state(test_loss)
-            test_accuracy_metric.update_state(test_labels, test_predictions)
-            test_recon_loss_metric.update_state(test_recon_loss)
 
     for epoch in range(num_epochs):
         start_time = time.time()
@@ -1177,54 +1187,31 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
             images, labels = next(train_iter)
             (loss_value, recon_loss, predictions, combined_input,
              hidden, latent, quantum_entropy, gate_probs, episodic_memory,
-             gating_signal, alignment_score) = train_step(images, labels, plasticity_weight_val)
+             gating_signal, alignment_score) = train_step(model, loss_fn, recon_loss_fn, optimizer, ae_optimizer,
+                                                          critic_optimizer, images, labels, plasticity_weight_val)
 
             # Update metrics.
             train_loss_metric.update_state(loss_value)
             train_accuracy_metric.update_state(labels, predictions)
             train_recon_loss_metric.update_state(recon_loss)
-
-            # Update critic monitoring metrics.
             mean_alignment_metric.update_state(alignment_score)
             mean_gating_metric.update_state(gating_signal)
 
             # Log every 100 steps.
-            if step % 100 == 0:
-                print(
-                    f"Training loss at step {step}/{train_steps}: {float(loss_value):.4f}"
-                )
+            if step % 10 == 0:
+                print(f"Training loss at step {step}/{train_steps}: {float(loss_value):.4f}")
 
             # Compute reinforcement signals and neuromodulatory factors.
-            pre_activity = tf.reduce_mean(combined_input, axis=0)
-            post_activity = tf.reduce_mean(hidden, axis=0)
-            novelty = tf.math.reduce_std(hidden)
-            avg_uncertainty = tf.reduce_mean(quantum_entropy)
-            combined_reward = model.reinforcement_layer(loss_value, recon_loss, novelty, avg_uncertainty)
-            reward = combined_reward * global_reward_scaling_factor
+            reward, pre_activity, post_activity = compute_reinforcement_signals(model, combined_input, hidden, quantum_entropy,
+                                                   loss_value, recon_loss, global_reward_scaling_factor)
             base_neuromod_signal = compute_neuromodulatory_signal(predictions, reward)
             latent_signal = tf.reduce_mean(compute_latent_mod(latent))
-            neuromod_signal = base_neuromod_signal * latent_signal
-
+            neuromod_signal = base_neuromod_signal * latent_signal            
             # Apply plasticity updates if scheduled.
             if plasticity_weight_val > 0 and tf.equal(global_step % plasticity_update_interval, 0):
-                chaotic_factor = model.chaotic_modulator(global_plasticity_weight_multiplier.numpy())
-                global_plasticity_weight_multiplier.assign(chaotic_factor)
-                global_reward_scaling_factor.assign(chaotic_factor)
-
-                # Create a plasticity feature vector for meta plasticity controller.
-                all_ws = tf.stack([tf.convert_to_tensor(expert.w) for expert in model.hidden.experts], axis=0) # Shape: (num_experts, ...)
-                avg_weight = tf.reduce_mean(tf.abs(all_ws))
-                plasticity_features = tf.stack([tf.reduce_mean(pre_activity),
-                                                tf.reduce_mean(post_activity),
-                                                avg_weight], axis=0)
-                plasticity_features = tf.expand_dims(plasticity_features, axis=0)  # shape: (1,3)
-                scale_factor, bias_adjustment, update_gate = model.meta_plasticity_controller(plasticity_features)
-
-                gate_modulation = tf.reduce_mean(gating_signal)
-                # Apply the batched plasticity update across all experts.
-                delta_ws, delta_delays = model.hidden.batch_plasticity_update(pre_activity, post_activity, reward,
-                                                                               neuromod_signal,
-                                                                               scale_factor, bias_adjustment, update_gate, gate_modulation)
+                delta_ws, delta_delays = scheduled_plasticity_updates(model, global_plasticity_weight_multiplier,
+                                                                      global_reward_scaling_factor, pre_activity,
+                                                                      post_activity, gating_signal, reward, neuromod_signal)
 
             if tf.equal(global_step % homeostasis_interval, 0):
                 for expert in model.hidden.experts:
@@ -1249,7 +1236,8 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         train_recon_loss_metric.reset_state()
 
         # Validation Evaluation.
-        val_step(val_iter, val_steps)
+        val_step(model, loss_fn, recon_loss_fn, val_loss_metric, val_accuracy_metric,
+                 val_recon_loss_metric, val_iter, val_steps)
         current_val_loss = val_loss_metric.result().numpy()
         current_val_recon_loss = val_recon_loss_metric.result().numpy()
         print(f"Val Loss   : {current_val_loss:.4f}, "
@@ -1260,7 +1248,8 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         val_recon_loss_metric.reset_state()
 
         # Test Evaluation.
-        test_step(test_iter, test_steps)
+        test_step(model, loss_fn, recon_loss_fn, test_loss_metric, test_accuracy_metric,
+                  test_recon_loss_metric, test_iter, test_steps)
         print(f"Test Loss  : {test_loss_metric.result():.4f}, "
               f"Test Accuracy  : {test_accuracy_metric.result():.4f}, "
               f"Test Recon Loss : {test_recon_loss_metric.result():.4f}")
@@ -1301,6 +1290,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                     model.save(f"models/{model_name}.keras")
                 break
         print(f"\nTime taken: {time.time() - start_time:.2f}s\n")
+
 # =========================================
 # Data Loading and Preprocessing Functions
 # =========================================
@@ -1341,7 +1331,7 @@ def split_dataset(inputs, labels, train_frac=0.8, val_frac=0.1):
 
 def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
     inputs = inputs.astype(np.float32) / 9.0
-    inputs = inputs.reshape((-1, h, w, 1))
+    inputs = inputs.reshape((-1, h, w))
     dataset = tf.data.Dataset.from_tensor_slices((inputs, labels))
     if shuffle:
         dataset = dataset.shuffle(buffer_size=1000)
@@ -1352,17 +1342,17 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # Main Function: Build dataset, instantiate controllers and model, then train
 # ============================================================================
 def main():
-    batch_size = 1024
+    batch_size = 4096
     max_units = 64
     initial_units = 16
     epochs = 1000
-    experts = 1
-    num_layers = 1
-    h = 8
-    w = 8
+    experts = 8
+    num_layers = 8
+    h = 16
+    w = 16
     cnn_units = h*w
     window_size = h * w
-    learning_rate = 1e-3
+    learning_rate = 1e-2
     
     # Load data.
     sequence = get_base_data(num_samples=1_000_000)
@@ -1382,9 +1372,8 @@ def main():
     ds_test = create_tf_dataset(inp_test, lbl_test, h, w, batch_size)
     
     # Warm-ups
-    dummy_input1 = tf.zeros((1, h, w, 1))
+    dummy_input1 = tf.zeros((1, h, w))
     dummy_input2 = tf.zeros((h, w))    
-    # plasticity_controller = RecurrentPlasticityController(units=initial_units)
     # Instantiate the Model.
     model = PlasticityModelMoE(h, w, units=cnn_units, 
                            num_experts=experts, num_layers=num_layers, max_units=max_units, initial_units=initial_units, num_classes=10)
@@ -1398,7 +1387,7 @@ def main():
     _ = model.hidden.experts[0](tf.random.normal((1, 384)), training=False)
     model.summary()
     # model.load_weights("model_weights/MetaSynapse_NextGen_RL_v2/model.weights.h5", skip_mismatch=True)
-    model_name = "MetaSynapse_NextGen_RL_v2b"
+    model_name = "MetaSynapse_NextGen_RL_v2c"
     train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
                 num_epochs=epochs, homeostasis_interval=13, architecture_update_interval=34,
                 plasticity_update_interval=5, plasticity_start_epoch=3, learning_rate=learning_rate)
