@@ -551,16 +551,16 @@ class UnsupervisedFeatureExtractor(tf.keras.Model):
         super(UnsupervisedFeatureExtractor, self).__init__(**kwargs)
         self.units = units
         # Encoder layers
-        self.enc_cnn1 = tf.keras.layers.Conv2D(self.units//2, (3, 3), activation="relu", padding="same", name="enc_cnn1")
+        self.enc_cnn1 = tf.keras.layers.Conv2D(self.units, (3, 3), activation="relu", padding="same", name="enc_cnn1")
         self.enc_pool1 = tf.keras.layers.MaxPooling2D((2, 2), padding="same", name="enc_pool1")
-        self.enc_cnn2 = tf.keras.layers.Conv2D(self.units, (3, 3), activation="relu", padding="same", name="enc_cnn2")
+        self.enc_cnn2 = tf.keras.layers.Conv2D(self.units*2, (3, 3), activation="relu", padding="same", name="enc_cnn2")
         self.enc_pool2 = tf.keras.layers.MaxPooling2D((2, 2), padding="same", name="enc_pool2")
-        self.enc_latent = tf.keras.layers.Conv2D(self.units * 2, (3, 3), activation="relu", padding="same", name="enc_latent")
+        self.enc_latent = tf.keras.layers.Conv2D(self.units*4, (3, 3), activation="relu", padding="same", name="enc_latent")
         self.global_avg_pool = tf.keras.layers.GlobalAveragePooling2D(name="global_avg_pool")
         # Decoder layers
-        self.dec_upconv1 = tf.keras.layers.Conv2DTranspose(self.units, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv1")
+        self.dec_upconv1 = tf.keras.layers.Conv2DTranspose(self.units*2, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv1")
         self.dec_concat1 = tf.keras.layers.Concatenate(name="dec_concat1")
-        self.dec_upconv2 = tf.keras.layers.Conv2DTranspose(self.units//2, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv2")
+        self.dec_upconv2 = tf.keras.layers.Conv2DTranspose(self.units, (3, 3), strides=2, activation="relu", padding="same", name="dec_upconv2")
         self.dec_output = tf.keras.layers.Conv2D(1, (3, 3), activation="sigmoid", padding="same", name="dec_output")        
 
     def build(self, input_shape):
@@ -883,7 +883,7 @@ class EpisodicMemory(tf.keras.layers.Layer):
 # ===============================================================================
 class PlasticityModelMoE(tf.keras.Model):
     def __init__(self, h, w, plasticity_controller, units=128, num_experts=2, max_units=128, 
-                 initial_units=32, num_classes=10, memory_size=512, memory_dim=128, **kwargs):
+                 initial_units=32, num_classes=10, memory_size=10, memory_dim=64, **kwargs):
         super(PlasticityModelMoE, self).__init__(**kwargs)
         self.units = units
         self.plasticity_controller = plasticity_controller
@@ -895,12 +895,12 @@ class PlasticityModelMoE(tf.keras.Model):
         self.memory_dim = memory_dim
         self.act = LearnedQuantumActivation()
         # Classic CNN based network layers
-        self.cnn1 = tf.keras.layers.Conv2D(128, (3,3), activation='relu', padding='same')
-        self.cnn2 = tf.keras.layers.Conv2D(256, (3,3), activation='relu', padding='same')
-        self.cnn3 = tf.keras.layers.Conv2D(512, (3,3), activation='relu', padding='same')
-        self.drop = tf.keras.layers.Dropout(0.9)
+        self.cnn1 = tf.keras.layers.Conv2D(units//4, (3,3), activation='relu', padding='same')
+        self.cnn2 = tf.keras.layers.Conv2D(units//2, (3,3), activation='relu', padding='same')
+        self.cnn3 = tf.keras.layers.Conv2D(units, (3,3), activation='relu', padding='same')
+        self.drop = tf.keras.layers.Dropout(0.0)
         self.flatten = tf.keras.layers.GlobalAveragePooling2D()
-        self.dens = tf.keras.layers.Dense(512, activation='relu', name='pm_dens1')
+        self.dens = tf.keras.layers.Dense(units, activation='relu', name='pm_dens1')
         self.classification_head = tf.keras.layers.Dense(self.num_classes, activation='softmax', name='pm_dens2')
         # Instantiate the quantum inspired layers.
         # Project hidden activations to dimension 16 (for 4 qubits: 2**4 = 16)
@@ -919,16 +919,13 @@ class PlasticityModelMoE(tf.keras.Model):
         self.feature_combiner = tf.keras.layers.Dense(self.units, activation='relu', name='pm_dens2')
         self.uncertainty_head = tf.keras.layers.Dense(1, activation='sigmoid', name='pm_dens3')
         # Project episodic_memory to dimension D.
-        self.episodic_memory = EpisodicMemory(self.memory_size, self.units)
+        self.episodic_memory = EpisodicMemory(self.memory_size, self.memory_dim)
         self.projected_memory = tf.keras.layers.Dense(10, kernel_initializer='glorot_uniform')
         # Instantiate the Critic.
         self.critic = MetacognitiveCritic(hidden_units=64)
 
     def build(self, input_shape):
         # Initialize loss weights as trainable variables.
-        self.loss_weight = self.add_weight(
-            shape=(), initializer=tf.keras.initializers.Constant(1.0),
-            trainable=True, name="loss_weight")        
         self.recon_loss_weight = self.add_weight(
             shape=(), initializer=tf.keras.initializers.Constant(0.1),
             trainable=True, name="recon_loss_weight")
@@ -1020,8 +1017,8 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                 critic_loss_weight=0.1):
     # Set up optimizers.
     optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
-    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
-    critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=1e-4)
+    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=1e-3)
+    critic_optimizer = tf.keras.optimizers.AdamW(learning_rate=1e-3)
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     recon_loss_fn = tf.keras.losses.Huber()
 
@@ -1044,12 +1041,13 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     global_reward_scaling_factor = tf.Variable(0.1, trainable=True, dtype=tf.float32)
     global_step = tf.Variable(0, dtype=tf.int64)
     best_val_loss = np.inf
+    best_val_recon_loss = np.inf
     patience_counter = 0
     best_weights = None
 
     # Integrated training step: one forward/backward pass for both model and critic.
     def train_step(images, labels, plasticity_weight_val):
-        with tf.GradientTape(persistent=False) as tape:
+        with tf.GradientTape(persistent=True) as tape:
             # Forward pass through the base model.
             (predictions, combined_input, hidden, reconstruction, uncertainty,
              latent, quantum_entropy, gate_probs, episodic_memory,
@@ -1060,22 +1058,22 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
             recon_loss = recon_loss_fn(images, reconstruction)
             mean_uncertainty = tf.reduce_mean(uncertainty)
             uncertainty_loss = tf.reduce_mean(tf.square(uncertainty - mean_uncertainty))
-            total_loss = model.loss_weight*loss + model.recon_loss_weight*recon_loss + model.uncertainty_loss_weight*uncertainty_loss
+            total_loss = loss + model.recon_loss_weight*recon_loss + model.uncertainty_loss_weight*uncertainty_loss
 
             # Compute critic outputs and loss.
             c_loss = critic_alignment_loss(episodic_memory, predictions)
-            total_loss += critic_loss_weight * c_loss
+            total_loss += critic_loss_weight * alignment_score
 
         # Update the base model.
         model_grads = tape.gradient(total_loss, model.trainable_variables)
         optimizer.apply_gradients(zip(model_grads, model.trainable_variables))
         # Update autoencoder.
-        # ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
-        # ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))        
+        ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
+        ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))  
         # # Update the critic network.
-        # critic_grads = tape.gradient(c_loss, model.critic.trainable_variables)
-        # critic_optimizer.apply_gradients(zip(critic_grads, model.critic.trainable_variables))
-        # del tape
+        critic_grads = tape.gradient(alignment_score, model.critic.trainable_variables)
+        critic_optimizer.apply_gradients(zip(critic_grads, model.critic.trainable_variables))
+        del tape
 
         return (total_loss, loss, recon_loss, predictions, combined_input,
                 hidden, latent, quantum_entropy, gate_probs, episodic_memory, gating_signal, alignment_score, c_loss)
@@ -1175,6 +1173,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
             val_accuracy_metric(val_labels, val_predictions)
             val_recon_loss_metric(val_recon_loss)
         current_val_loss = val_loss_metric.result().numpy()
+        current_val_recon_loss = val_recon_loss_metric.result().numpy()
         print(f"Val Loss   : {current_val_loss:.4f}, "
               f"Val Accuracy   : {val_accuracy_metric.result():.4f}, "
               f"Val Recon Loss : {val_recon_loss_metric.result():.4f}")
@@ -1198,6 +1197,22 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         test_accuracy_metric.reset_state()
         test_recon_loss_metric.reset_state()
 
+        # Early stopping AutoEncoder
+        if current_val_recon_loss < best_val_recon_loss - early_stop_min_delta:
+            best_val_recon_loss = current_val_recon_loss
+            recon_counter = 0
+            recon_best_weights = model.unsupervised_extractor.get_weights()
+            print("\nRecon validation loss improved; resetting recon counter.")
+            model.unsupervised_extractor.save(f"checkpoints/extractors/{model_name}.keras")
+        else:
+            recon_counter += 1
+            print(f"\nNo improvement in recon validation loss for {recon_counter} epoch(s).")
+            if recon_counter >= 2:
+                if recon_best_weights is not None:
+                    print("Restoring recon best weights and saving model.\n")
+                    model.unsupervised_extractor.set_weights(recon_best_weights)
+                    model.unsupervised_extractor.save(f"models/extractors/{model_name}.keras")        
+
         # Early Stopping.
         if current_val_loss < best_val_loss - early_stop_min_delta:
             best_val_loss = current_val_loss
@@ -1205,7 +1220,6 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
             best_weights = model.get_weights()
             print("\nValidation loss improved; resetting patience counter.")
             model.save(f"checkpoints/{model_name}.keras")
-            model.unsupervised_extractor.save(f"checkpoints/extractors/{model_name}.keras")
         else:
             patience_counter += 1
             print(f"\nNo improvement in validation loss for {patience_counter} epoch(s).")
@@ -1214,7 +1228,6 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                     print("Restoring best weights and saving model.\n")
                     model.set_weights(best_weights)
                     model.save(f"models/{model_name}.keras")
-                    model.unsupervised_extractor.save(f"models/extractors/{model_name}.keras")
                 break
 
 # =========================================
@@ -1268,9 +1281,9 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # Main Function: Build dataset, instantiate controllers and model, then train
 # ============================================================================
 def main():
-    batch_size = 64
-    max_units = 128
-    initial_units = 64
+    batch_size = 128
+    max_units = 64
+    initial_units = 16
     epochs = 1000
     experts = 3
     h = 8
@@ -1281,8 +1294,8 @@ def main():
     
     # Load data.
     sequence = get_base_data(num_samples=10_000)
-    inputs, labels = create_windows(sequence, window_size=window_size+1)
-    (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
+    input_data, labels = create_windows(sequence, window_size=window_size+1)
+    (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(input_data, labels)
     
     train_len = inp_train.shape[0]
     val_len = inp_val.shape[0]
@@ -1313,11 +1326,10 @@ def main():
     _ = model.reinforcement_layer(tf.zeros([2]),tf.zeros([2]),tf.zeros([2]),tf.zeros([2]),training=False)
     _ = model.chaotic_modulator(tf.zeros([2]), training=False)
     model.summary()
-    model_name = "MetaSynapse_NextGen_RL_v1a"
+    model_name = "MetaSynapse_NextGen_RL_v1b"
     train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
-                num_epochs=epochs, homeostasis_interval=1, architecture_update_interval=1,
-                plasticity_update_interval=1, plasticity_start_epoch=1, learning_rate=learning_rate)
+                num_epochs=epochs, homeostasis_interval=5, architecture_update_interval=8,
+                plasticity_update_interval=3, plasticity_start_epoch=10, learning_rate=learning_rate)
     
 if __name__ == '__main__':
     main()
-
