@@ -37,7 +37,7 @@ class LearnedActivation(tf.keras.layers.Layer):
         return results
         
 # =============================================================================
-# 2. Recurrent Plasticity Controller: Meta-learning the plasticity rules.
+# 2. Recurrent Plasticity Controller with Self-Att: Meta-learning the plasticity rules.
 # =============================================================================
 class RecurrentPlasticityController(tf.keras.layers.Layer):
     def __init__(self, units=16, sequence_length=10, **kwargs):
@@ -49,6 +49,8 @@ class RecurrentPlasticityController(tf.keras.layers.Layer):
         super(RecurrentPlasticityController, self).__init__(**kwargs)
         self.sequence_length = sequence_length
         self.gru = tf.keras.layers.GRU(units, return_sequences=False)
+        self.attention = tf.keras.layers.MultiHeadAttention(num_heads=2, key_dim=units)
+        self.flatten = tf.keras.layers.Flatten()
         self.dense = tf.keras.layers.Dense(2, activation=None)
     @tf.function
     def call(self, input_sequence):
@@ -58,8 +60,11 @@ class RecurrentPlasticityController(tf.keras.layers.Layer):
         Returns:
             adjustments: Tensor of shape (batch, 2) representing [delta_add, delta_mult]
         """
-        output = self.gru(input_sequence)
-        adjustments = self.dense(output)
+        attn_output = self.attention(input_sequence,input_sequence)
+        x = self.gru(attn_output)
+        #combined = x + attn_output
+        #flattened = self.flatten(combined)
+        adjustments = self.dense(x)
         return adjustments
 
 # =============================================================================
@@ -354,12 +359,13 @@ class PlasticityModelMoE(tf.keras.Model):
 def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=1000,
                 homeostasis_interval=13, architecture_update_interval=21,
                 plasticity_update_interval=8, plasticity_start_epoch=3,
-                early_stop_patience=10, early_stop_min_delta=1e-4, **kwargs):
+                early_stop_patience=10, early_stop_min_delta=1e-4, learning_rate=1e-3, **kwargs):
+                
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     recon_loss_fn = tf.keras.losses.MeanSquaredError()
     uncertainty_loss_fn = tf.keras.losses.MeanSquaredError()
     
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
     
     # Global variables controlled by the recurrent plasticity controller.
     global_plasticity_weight_multiplier = tf.Variable(0.5, trainable=False, dtype=tf.float32)
@@ -434,12 +440,12 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                      compute_reinforcement_signals(loss, recon_loss, predictions, hidden, reward)
             
             if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
-                chaos_state = chaotic_modulation(0.5)  # starting chaos state (can be updated)
-                neuromod_signal = compute_neuromodulatory_signal(predictions, reward)
                 for expert in model.hidden.experts:
-                    plasticity_delta = expert.plasticity_update(pre_activity, post_activity, reward)
+                    expert_reward = compute_expert_reward(images, reconstruction, labels, predictions)
+                    neuromod_signal = compute_neuromodulatory_signal(predictions, expert_reward)
+                    plasticity_delta = expert.plasticity_update(pre_activity, post_activity, expert_reward)
                     if tf.reduce_sum(tf.abs(plasticity_delta)) > 0:
-                        plasticity_delta *= plasticity_weight * chaos_state * neuromod_signal
+                        plasticity_delta *= plasticity_weight * neuromod_signal
                         plasticity_delta = tf.clip_by_norm(plasticity_delta, clip_norm=0.05)
                         expert.apply_plasticity(plasticity_delta)
             
@@ -523,11 +529,14 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
             patience_counter += 1
             print(f"\nNo improvement in validation loss for {patience_counter} epoch(s).")
             if patience_counter >= early_stop_patience:
-                print("Early stopping triggered. Restoring best weights and ending training.\n")
+                #print("Early stopping triggered. Restoring best weights and ending training.\n")
                 if best_weights is not None:
+                    print("Restoring best weights and saving model.\n")
                     model.set_weights(best_weights)
-                    model.save("models/MetaSynapse_NextGen_v3b.keras")
-                break  # Exit the epoch loop.
+                    model.save("models/MetaSynapse_NextGen_v3c.keras")
+                    model.unsupervised_extractor.save("models/unsupervised_extractor_v3c.keras")
+                    patience_counter = 0
+                #break  # Exit the epoch loop.
 
 # =============================================================================
 # 8. Helper functions for chaotic modulation, neuromodulatory signal, and reinforcement signals.
@@ -554,14 +563,24 @@ def compute_reinforcement_signals(loss, recon_loss, predictions, hidden, externa
     novelty = tf.math.reduce_std(hidden)
     entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
     avg_uncertainty = tf.reduce_mean(entropy)
-    
     loss_signal = tf.sigmoid(-loss)
     recon_signal = 0.5 * tf.sigmoid(-recon_loss)
     novelty_signal = 0.5 * tf.sigmoid(novelty)
     uncertainty_signal = 0.5 * tf.sigmoid(avg_uncertainty)
-    
     combined_reward = loss_signal + recon_signal + novelty_signal + uncertainty_signal + external_reward
     return combined_reward
+    
+def compute_expert_reward(expert_hidden, expert_reconstruction, labels, predictions):
+    # Calculate expert-specific reconstruction loss.
+    recon_loss = tf.keras.losses.MeanSquaredError()(expert_hidden, expert_reconstruction)
+    # Measure novelty through activation standard deviation.
+    novelty = tf.math.reduce_std(expert_hidden)
+    # Use entropy as a proxy for uncertainty.
+    entropy = -tf.reduce_sum(predictions * tf.math.log(predictions + 1e-6), axis=-1)
+    uncertainty = tf.reduce_mean(entropy)
+    # Combine the metrics into a specialized reward signal.
+    expert_reward = tf.sigmoid(-recon_loss) + 0.5 * tf.sigmoid(novelty) + 0.5 * tf.sigmoid(-uncertainty)
+    return expert_reward    
     
 # =============================================================================
 # 9. Data loading functions.
@@ -607,14 +626,15 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # 10. Main function: Build dataset, instantiate controllers and model, then train.
 # =============================================================================
 def main():
-    batch_size = 64
+    batch_size = 128
     max_units = 256
     initial_units = 128
     epochs = 1000
     experts = 32
-    h = 4
-    w = 4
+    h = 8
+    w = 8
     window_size = h*w
+    learning_rate=1e-4
     
     # Load data.
     sequence = get_real_data(num_samples=1_000)
@@ -642,11 +662,12 @@ def main():
     dummy_input = tf.zeros((1, h, w, 1))
     _ = model(dummy_input, training=False)
     model.summary()
+    model.load_weights('model_weights/MetaSynapse_NextGen_v3c/model.weights.h5')
     
     # Train the model.
     train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=epochs,
-                homeostasis_interval=13, architecture_update_interval=89,
-                plasticity_update_interval=8, plasticity_start_epoch=1)
+                homeostasis_interval=5, architecture_update_interval=21,
+                plasticity_update_interval=3, plasticity_start_epoch=1, learning_rate=learning_rate)
     
 if __name__ == '__main__':
     main()
