@@ -401,94 +401,63 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         output_shape[-1] = self.max_units
         return tuple(output_shape)
 
+import tensorflow as tf
+
 class AdaptiveMetaController(tf.keras.layers.Layer):
     def __init__(self, hidden_units=16, **kwargs):
         super(AdaptiveMetaController, self).__init__(**kwargs)
-        # A shared hidden layer to extract features from training dynamics.
         self.shared_dense = tf.keras.layers.Dense(hidden_units, activation='relu')
-        # Output six signals:
-        # 1. interval_offset: Adjustment for update intervals.
-        # 2. plasticity_mod: Scaling for plasticity updates.
-        # 3. homeostasis_mod: Scaling for homeostatic updates.
-        # 4. structural_mod: Scaling for structural plasticity updates.
-        # 5. arch_threshold_adj: Adjustment factor for architecture threshold.
-        # 6. lr_multiplier: Multiplier for learning rate updates.
-        self.out_dense = tf.keras.layers.Dense(6, activation=None)
+        # Now output 10 signals:
+        # 0: (unused raw offset if desired)
+        # 1: plasticity_mod (sigmoid, in (0,1))
+        # 2: homeostasis_mod (sigmoid, in (0,1))
+        # 3: structural_mod (sigmoid, in (0,1))
+        # 4: arch_threshold_adj (sigmoid, in (0,1))
+        # 5: lr_multiplier (0.5 + 0.5 * sigmoid, in (0.5,1.0))
+        # 6: homeo_interval (softplus, positive, then clipped)
+        # 7: structural_interval (softplus, positive, then clipped)
+        # 8: architecture_interval (softplus, positive, then clipped)
+        # 9: vectorized_interval (softplus, positive, then clipped)
+        self.out_dense = tf.keras.layers.Dense(10, activation=None)
 
     def call(self, features):
-        """
-        Input:
-            features: A tensor of training dynamics features (shape: [batch, feature_dim])
-        Returns:
-            A tuple of six signals:
-                interval_offset: raw adjustment (can be positive or negative)
-                plasticity_mod: scalar in (0, 1) for plasticity update scaling
-                homeostasis_mod: scalar in (0, 1) for homeostatic scaling
-                structural_mod: scalar in (0, 1) for structural update scaling
-                arch_threshold_adj: scalar in (0, 1) used to adjust the neuron threshold
-                lr_multiplier: scalar in (0.5, 1.0) for learning rate modulation
-        """
         x = self.shared_dense(features)
         out = self.out_dense(x)
         # Unpack outputs.
-        interval_offset = out[:, 0:1]    # No activation: raw offset.
-        plasticity_mod   = tf.nn.sigmoid(out[:, 1:2])  # In (0,1)
-        homeostasis_mod  = tf.nn.sigmoid(out[:, 2:3])  # In (0,1)
-        structural_mod   = tf.nn.sigmoid(out[:, 3:4])  # In (0,1)
-        arch_threshold_adj = tf.nn.sigmoid(out[:, 4:5])  # In (0,1); can scale a base threshold.
-        # Learning rate multiplier in range (0.5, 1.0)
+        # We ignore output[0] (could be used for a raw offset if needed)
+        plasticity_mod = tf.nn.sigmoid(out[:, 1:2])
+        homeostasis_mod  = tf.nn.sigmoid(out[:, 2:3])
+        structural_mod   = tf.nn.sigmoid(out[:, 3:4])
+        arch_threshold_adj = tf.nn.sigmoid(out[:, 4:5])
         lr_multiplier    = 0.5 + 0.5 * tf.nn.sigmoid(out[:, 5:6])
-        return (interval_offset, plasticity_mod, 
-                homeostasis_mod, structural_mod, 
-                arch_threshold_adj, lr_multiplier)
+        # For intervals, use softplus to ensure positivity.
+        homeo_interval = tf.nn.softplus(out[:, 6:7])
+        structural_interval = tf.nn.softplus(out[:, 7:8])
+        architecture_interval = tf.nn.softplus(out[:, 8:9])
+        vectorized_interval = tf.nn.softplus(out[:, 9:10])
+        # Optionally, clip intervals to a reasonable range, e.g. [1, 1000].
+        homeo_interval = tf.clip_by_value(homeo_interval, 1.0, 1000.0)
+        structural_interval = tf.clip_by_value(structural_interval, 1.0, 1000.0)
+        architecture_interval = tf.clip_by_value(architecture_interval, 1.0, 1000.0)
+        vectorized_interval = tf.clip_by_value(vectorized_interval, 1.0, 1000.0)
+        
+        return {
+            "plasticity_mod": plasticity_mod,
+            "homeostasis_mod": homeostasis_mod,
+            "structural_mod": structural_mod,
+            "arch_threshold_adj": arch_threshold_adj,
+            "lr_multiplier": lr_multiplier,
+            "homeo_interval": homeo_interval,
+            "structural_interval": structural_interval,
+            "architecture_interval": architecture_interval,
+            "vectorized_interval": vectorized_interval
+        }
 
-    def update_interval(self, current_interval, features):
-        """
-        Adjusts the current interval using the interval_offset signal.
-        """
-        interval_offset, _, _, _, _, _ = self.call(features)
-        new_interval = tf.cast(current_interval, tf.float32) + interval_offset[0, 0]
-        # Clip new_interval between 1 and 100.
-        new_interval = tf.clip_by_value(new_interval, 1.0, 100.0)
-        return new_interval
-
-    def get_plasticity_modulation(self, features):
-        """
-        Returns a scalar modulation signal for plasticity updates.
-        """
-        _, plasticity_mod, _, _, _, _ = self.call(features)
-        return plasticity_mod[0, 0]
-
-    def get_homeostasis_modulation(self, features):
-        """
-        Returns a scalar modulation signal for homeostatic scaling.
-        """
-        _, _, homeostasis_mod, _, _, _ = self.call(features)
-        return homeostasis_mod[0, 0]
-
-    def get_structural_modulation(self, features):
-        """
-        Returns a scalar modulation signal for structural plasticity.
-        """
-        _, _, _, structural_mod, _, _ = self.call(features)
-        return structural_mod[0, 0]
-
-    def get_architecture_threshold_override(self, base_threshold, features):
-        """
-        Adjusts the base architecture threshold by the learned factor.
-        """
-        _, _, _, _, arch_threshold_adj, _ = self.call(features)
-        new_threshold = base_threshold * arch_threshold_adj[0, 0]
-        return new_threshold
-
+    # Utility functions remain similar if needed; for example:
     def get_learning_rate(self, current_lr, features):
-        """
-        Returns an updated learning rate based on the lr_multiplier signal.
-        """
-        _, _, _, _, _, lr_multiplier = self.call(features)
+        lr_multiplier = self.call(features)["lr_multiplier"]
         new_lr = current_lr * lr_multiplier[0, 0]
-        new_lr = tf.maximum(new_lr, 1e-6)
-        return new_lr
+        return tf.maximum(new_lr, 1e-6)
 
 class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
     def __init__(self, num_experts, max_units, initial_units, plasticity_controller, neural_ode_plasticity, **kwargs):
@@ -872,7 +841,7 @@ class PlasticityModelMoE(tf.keras.Model):
         self.num_classes = num_classes
         self.memory_size = memory_size
         self.memory_dim = memory_dim
-        
+
         # CNN branch.
         self.cnn1 = tf.keras.layers.Conv1D(units//4, 3, activation='relu', padding='same')
         self.cnn2 = tf.keras.layers.Conv1D(units//2, 3, activation='relu', padding='same')
@@ -880,35 +849,35 @@ class PlasticityModelMoE(tf.keras.Model):
         # Replace fixed dropout with ConcreteDropout wrapping an IdentityLayer.
         self.concrete_dropout = ConcreteDropout(
             layer=IdentityLayer(),
-            weight_regularizer=0.0,         # No weight reg for identity.
+            weight_regularizer=0.0,         # IdentityLayer has no kernel.
             dropout_regularizer=1e-5,
             init_dropout=0.1,
             temperature=0.1
         )
         self.flatten = tf.keras.layers.GlobalAveragePooling1D()
-        
+
         # Dense layers.
         self.dens = tf.keras.layers.Dense(units, activation='relu', name='pm_dens1')
         self.classification_head = tf.keras.layers.Dense(self.num_classes, activation='softmax', name='pm_dens2')
-        self.feature_combiner = tf.keras.layers.Dense(units, activation='relu', name='pm_dens2')
-        
+        self.feature_combiner = tf.keras.layers.Dense(units, activation='relu', name='pm_feature_combiner')
+
         # Instantiate meta-controller.
-        self.meta_controller = AdaptiveMetaController(hidden_units=16)
-        
+        self.meta_controller = AdaptiveMetaController(hidden_units=units)
+
         # Plasticity control modules.
         self.neural_ode_plasticity = NeuralODEPlasticity(n_steps=10)
         self.hidden = MoE_DynamicPlasticLayer(self.num_experts, self.max_units, self.initial_units, 
                                                self.meta_controller, self.neural_ode_plasticity)
         self.chaotic_modulator = ChaoticModulation()
-        
+
         # Unsupervised branch.
         self.unsupervised_extractor = UnsupervisedFeatureExtractor(self.units)
         self.reinforcement_layer = ReinforcementSignalLayer()
-        
+
         # Episodic memory.
         self.episodic_memory = EpisodicMemory(self.memory_size, self.memory_dim)
         self.projected_memory = tf.keras.layers.Dense(10, kernel_initializer='glorot_uniform')
-        
+
         # Critic module.
         self.critic = MetacognitiveCritic(hidden_units=64)
 
@@ -926,52 +895,69 @@ class PlasticityModelMoE(tf.keras.Model):
         super(PlasticityModelMoE, self).build(input_shape)
 
     def call(self, x, training=False):
-        # Obtain flattened features from the input.
-        x_flat = self.flatten(x)  # shape: (batch, feature_dim)
-        meta_features = x_flat  # Use directly as meta features.
-        
-        # Get meta signals.
-        meta_signals = self.meta_controller(meta_features)
-        interval_offset, plasticity_mod, homeostasis_mod, structural_mod, arch_threshold_adj, lr_multiplier = meta_signals
-        
-        # Unsupervised branch.
-        latent, reconstruction = self.unsupervised_extractor(x)
-        # Pass a scalar homeostasis modulation signal.
-        memory_read = self.episodic_memory(latent, meta_modulation=tf.reduce_mean(homeostasis_mod))
-        
+        # # Compute a flattened representation from the input.
+        # x_flat = self.flatten(x)  # Shape: (batch, feature_dim)
+        # meta_features = x_flat  # Use these features for meta-control.
+
         # CNN branch.
         cnn1 = self.cnn1(x)
         cnn2 = self.cnn2(cnn1)
         cnn3 = self.cnn3(cnn2)
-        # Apply ConcreteDropout (learnable dropout) after CNN3.
         drop = self.concrete_dropout(cnn3, training=training)
         x_flat_cnn = self.flatten(drop)
-        
+
+        # Get meta signals from the meta-controller.
+        meta_signals = self.meta_controller(x_flat_cnn)
+        # Unpack meta signals.
+        plasticity_mod = meta_signals["plasticity_mod"]
+        homeostasis_mod = meta_signals["homeostasis_mod"]
+        structural_mod = meta_signals["structural_mod"]
+        arch_threshold_adj = meta_signals["arch_threshold_adj"]
+        lr_multiplier = meta_signals["lr_multiplier"]
+        homeo_interval = meta_signals["homeo_interval"]
+        structural_interval = meta_signals["structural_interval"]
+        architecture_interval = meta_signals["architecture_interval"]
+        vectorized_interval = meta_signals["vectorized_interval"]       
+
+        # Use the homeostasis_mod (averaged over batch) to modulate episodic memory updates.
+        memory_read = self.episodic_memory(x_flat_cnn, meta_modulation=tf.reduce_mean(homeostasis_mod))        
+
         # Plasticity control branch.
-        combined_input = tf.concat([x_flat_cnn, latent], axis=-1)
-        hidden_act = self.hidden(combined_input, latent, meta_forward=plasticity_mod)
-        combined2 = self.feature_combiner(hidden_act)
-        
+        # combined_input = tf.concat([x_flat_cnn, latent], axis=-1)
+        # Pass plasticity_mod to modulate the MoE hidden branch.
+        hidden_act = self.hidden(memory_read, meta_forward=plasticity_mod)
+        # combined2 = self.feature_combiner(hidden_act)
+
         # Main classification output.
-        class_out = self.classification_head(combined2)
-        
+        class_out = self.classification_head(hidden_act)
+
         # Critic outputs.
         gating_signal, alignment_score = self.critic(memory_read, class_out, hidden_act)
-        
-        return class_out, combined_input, hidden_act, reconstruction, latent, gating_signal, alignment_score
+
+        # Pack all meta signals into a dictionary for the training loop.
+        meta_dict = {
+            "plasticity_mod": plasticity_mod,
+            "homeostasis_mod": homeostasis_mod,
+            "structural_mod": structural_mod,
+            "arch_threshold_adj": arch_threshold_adj,
+            "lr_multiplier": lr_multiplier,
+            "homeo_interval": homeo_interval,
+            "structural_interval": structural_interval,
+            "architecture_interval": architecture_interval,
+            "vectorized_interval": vectorized_interval
+        }
+        return class_out, gating_signal, alignment_score, meta_dict
 
 # -------------------------
 # Helper Functions
 # -------------------------
 @tf.function
-def train_step(model, loss_fn, recon_loss_fn, optimizer, images, labels,
-               train_loss_metric, train_accuracy_metric, train_recon_loss_metric,
+def train_step(model, loss_fn, optimizer, images, labels,
+               train_loss_metric, train_accuracy_metric,
                mean_alignment_metric, mean_gating_metric):
     with tf.GradientTape() as tape:
-        (predictions, combined_input, hidden, reconstruction,
-         latent, gating_signal, alignment_score) = model(images, training=True)
+        (predictions, gating_signal, alignment_score, meta_dict) = model(images, training=True)
         classification_loss = loss_fn(labels, predictions)
-        reconstruction_loss = recon_loss_fn(images, reconstruction)
         critic_loss = tf.reduce_mean(1.0 - alignment_score)
         # Sum regularization losses from all ConcreteDropout layers.
         reg_loss = 0.0
@@ -981,162 +967,189 @@ def train_step(model, loss_fn, recon_loss_fn, optimizer, images, labels,
         # Combine losses.
         # Use the learned log_sigma parameters to weight each loss.
         w_class = tf.exp(-model.log_sigma_class)
-        w_recon = tf.exp(-model.log_sigma_recon)
         w_critic = tf.exp(-model.log_sigma_critic)
         
         weighted_class_loss = w_class * classification_loss + model.log_sigma_class
-        weighted_recon_loss = w_recon * reconstruction_loss + model.log_sigma_recon
         weighted_critic_loss = w_critic * critic_loss + model.log_sigma_critic
         
-        total_loss = weighted_class_loss + weighted_recon_loss + weighted_critic_loss + reg_loss
+        total_loss = weighted_class_loss + weighted_critic_loss + reg_loss
         
     grads = tape.gradient(total_loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
-    # # Compute an aggregate gradient norm for monitoring.
-    # grad_norms = [tf.norm(g) for g in grads if g is not None]
-    # avg_grad_norm = tf.reduce_mean(grad_norms)    
+    # Compute an aggregate gradient norm for monitoring.
+    grad_norms = [tf.norm(g) for g in grads if g is not None]
+    avg_grad_norm = tf.reduce_mean(grad_norms)    
     
     # Update metrics.
     train_loss_metric.update_state(total_loss)
     train_accuracy_metric.update_state(labels, predictions)
-    train_recon_loss_metric.update_state(reconstruction_loss)
     mean_alignment_metric.update_state(alignment_score)
     mean_gating_metric.update_state(gating_signal)
     
-    return total_loss
+    return total_loss, avg_grad_norm, meta_dict
 
 # -------------------------
 # Validation Step (Unchanged)
 # -------------------------
 @tf.function
-def val_step(model, loss_fn, recon_loss_fn, val_loss_metric, val_accuracy_metric,
-             val_recon_loss_metric, val_iter, val_steps):
+def val_step(model, loss_fn, val_loss_metric, val_accuracy_metric, val_iter, val_steps):
     for _ in range(val_steps):
         val_images, val_labels = next(val_iter)
-        val_predictions, _, _, val_reconstruction, _, _, _ = model(val_images, training=False)
+        val_predictions, _, _, _ = model(val_images, training=False)
         val_loss = loss_fn(val_labels, val_predictions)
-        val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
         val_loss_metric.update_state(val_loss)
         val_accuracy_metric.update_state(val_labels, val_predictions)
-        val_recon_loss_metric.update_state(val_recon_loss)
 
 # -------------------------
 # Test Step (Unchanged)
 # -------------------------
 @tf.function
-def test_step(model, loss_fn, recon_loss_fn, test_loss_metric, test_accuracy_metric,
-              test_recon_loss_metric, test_iter, test_steps):
+def test_step(model, loss_fn, test_loss_metric, test_accuracy_metric, test_iter, test_steps):
     for _ in range(test_steps):
         test_images, test_labels = next(test_iter)
-        test_predictions, _, _, test_reconstruction, _, _, _ = model(test_images, training=False)
+        test_predictions, _, _, _ = model(test_images, training=False)
         test_loss = loss_fn(test_labels, test_predictions)
-        test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
         test_loss_metric.update_state(test_loss)
         test_accuracy_metric.update_state(test_labels, test_predictions)
-        test_recon_loss_metric.update_state(test_recon_loss)
 
 # -------------------------
 # Unified Training Loop
 # -------------------------
 def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
-                num_epochs=1000, initial_lr=1e-3, early_stop_patience=100, early_stop_min_delta=1e-4, log_dir="./logs"):
+                num_epochs=1000, initial_lr=1e-3,
+                base_homeo_interval=50, base_structural_interval=50, base_architecture_interval=50, base_vectorized_interval=50,
+                early_stop_patience=100, early_stop_min_delta=1e-4,
+                log_dir="./logs"):
     # Use a single optimizer for all parameters.
     optimizer = tf.keras.optimizers.AdamW(learning_rate=initial_lr)
-    
-    # Define loss functions.
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
-    recon_loss_fn = tf.keras.losses.Huber()
     
-    # Initialize metrics.
-    train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
-    train_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-    val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
-    val_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
-    test_loss_metric = tf.keras.metrics.Mean(name='test_loss')
-    test_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
-    train_recon_loss_metric = tf.keras.metrics.Mean(name='train_recon_loss')
-    val_recon_loss_metric = tf.keras.metrics.Mean(name='val_recon_loss')
-    test_recon_loss_metric = tf.keras.metrics.Mean(name='test_recon_loss')
+    # Define metrics.
+    train_loss_metric = tf.keras.metrics.Mean(name="train_loss")
+    train_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="train_accuracy")
+    val_loss_metric = tf.keras.metrics.Mean(name="val_loss")
+    val_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="val_accuracy")
+    test_loss_metric = tf.keras.metrics.Mean(name="test_loss")
+    test_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name="test_accuracy")
     mean_alignment_metric = tf.keras.metrics.Mean(name="mean_alignment_score")
     mean_gating_metric = tf.keras.metrics.Mean(name="mean_gating_signal")
     
     best_val_loss = np.inf
     patience_counter = 0
     best_weights = None
-
-    # # Create TensorBoard writer.
-    # writer = tf.summary.create_file_writer(os.path.join(log_dir, model_name))
-           
+    global_step = 0
+    
+    writer = tf.summary.create_file_writer(os.path.join(log_dir, model_name))
+    
     for epoch in range(num_epochs):
         start_time = time.time()
         train_iter = iter(ds_train)
         val_iter = iter(ds_val)
         test_iter = iter(ds_test)
         
-        # Process all training batches.
-        # epoch_grad_norms = []
+        epoch_grad_norms = []
         for _ in range(train_steps):
             images, labels = next(train_iter)
-            train_step(model, loss_fn, recon_loss_fn, optimizer, images, labels,
-                       train_loss_metric, train_accuracy_metric, train_recon_loss_metric,
-                       mean_alignment_metric, mean_gating_metric)
-            # epoch_grad_norms.append(avg_grad_norm)
-        current_train_loss = train_loss_metric.result().numpy()
-        tf.print(f"Epoch {epoch+1}/{num_epochs}\nTrain Loss : {current_train_loss:.4f} | Train Accuracy : {train_accuracy_metric.result():.4f}")        
+            total_loss, avg_grad_norm, meta_dict = train_step(model, loss_fn, optimizer, images, labels,
+                                                              train_loss_metric, train_accuracy_metric,
+                                                              mean_alignment_metric, mean_gating_metric)
+            epoch_grad_norms.append(avg_grad_norm)
+            global_step += 1        
+            
+            # Directly use learned dynamic intervals from meta_dict.
+            dynamic_homeo_interval = tf.cast(tf.clip_by_value(tf.reduce_mean(meta_dict["homeo_interval"]), 1, 1000), tf.int32)
+            dynamic_structural_interval = tf.cast(tf.clip_by_value(tf.reduce_mean(meta_dict["structural_interval"]), 1, 1000), tf.int32)
+            dynamic_architecture_interval = tf.cast(tf.clip_by_value(tf.reduce_mean(meta_dict["architecture_interval"]), 1, 1000), tf.int32)
+            dynamic_vectorized_interval = tf.cast(tf.clip_by_value(tf.reduce_mean(meta_dict["vectorized_interval"]), 1, 1000), tf.int32)
+            lr_multiplier = tf.reduce_mean(meta_dict["lr_multiplier"])
+            
+            # Conditionally apply each plasticity update.
+            if global_step % dynamic_homeo_interval == 0:
+                for expert in model.hidden.experts:
+                    expert.apply_homeostatic_scaling(meta_modulation=tf.reduce_mean(meta_dict["homeostasis_mod"]))
+            
+            if global_step % dynamic_structural_interval == 0:
+                for expert in model.hidden.experts:
+                    expert.apply_structural_plasticity(meta_modulation=tf.reduce_mean(meta_dict["structural_mod"]))
+            
+            if global_step % dynamic_architecture_interval == 0:
+                for expert in model.hidden.experts:
+                    expert.apply_architecture_modification(meta_threshold=tf.reduce_mean(meta_dict["arch_threshold_adj"]))
+            
+            if global_step % dynamic_vectorized_interval == 0:
+                # Compute reinforcement signals from combined input and hidden activations.
+                reward, pre_activity, post_activity = compute_reinforcement_signals(model, None, None, 0.0, 0.0, 1.0)
+                # Also compute neuromodulatory signal from predictions.
+                dummy_predictions = tf.zeros((1, model.num_classes))
+                base_neuromod_signal = compute_neuromodulatory_signal(dummy_predictions, 0.0)
+                # Use plasticity_mod as meta for vectorized update.
+                plasticity_meta = tf.reduce_mean(meta_dict["plasticity_mod"])
+                for expert in model.hidden.experts:
+                    delta_ws, delta_delays = expert.vectorized_plasticity_update(pre_activity, post_activity, reward,
+                                                                                  base_neuromod_signal,
+                                                                                  meta_signal=plasticity_meta)
+                    expert.w.assign_add(delta_ws)
+                    expert.delay.assign_add(delta_delays)
+
+            
+
+        # Update learning rate.
+        new_lr = initial_lr * lr_multiplier
+        optimizer.learning_rate.assign(new_lr)
+
+        epoch_grad_norm = tf.reduce_mean(epoch_grad_norms)                
         
         # Run validation.
-        val_step(model, loss_fn, recon_loss_fn, val_loss_metric, val_accuracy_metric, val_recon_loss_metric, val_iter, val_steps)
+        val_step(model, loss_fn, val_loss_metric, val_accuracy_metric, val_iter, val_steps)
         current_val_loss = val_loss_metric.result().numpy()
-        tf.print(f"Val Loss   : {current_val_loss:.4f} | Val Accuracy   : {val_accuracy_metric.result():.4f}")
-        # val_loss_metric.reset_state()
-        # val_accuracy_metric.reset_state()
-        # val_recon_loss_metric.reset_state()
         
         # Run testing.
-        test_step(model, loss_fn, recon_loss_fn, test_loss_metric, test_accuracy_metric, test_recon_loss_metric, test_iter, test_steps)
-        tf.print(f"Test Loss : {test_loss_metric.result():.4f} | Test Accuracy : {test_accuracy_metric.result():.4f}")
-        # test_loss_metric.reset_state()
-        # test_accuracy_metric.reset_state()
-        # test_recon_loss_metric.reset_state()
-
-        # # Write TensorBoard summaries.
-        # with writer.as_default():
-        #     tf.summary.scalar("train_loss", train_loss_metric.result(), step=epoch)
-        #     tf.summary.scalar("train_accuracy", train_accuracy_metric.result(), step=epoch)
-        #     tf.summary.scalar("val_loss", current_val_loss, step=epoch)
-        #     tf.summary.scalar("val_accuracy", val_accuracy_metric.result(), step=epoch)
-        #     tf.summary.scalar("test_loss", test_loss_metric.result(), step=epoch)
-        #     tf.summary.scalar("test_accuracy", test_accuracy_metric.result(), step=epoch)
-        #     tf.summary.scalar("avg_grad_norm", epoch_grad_norms, step=epoch)
-        #     # Log the learned dropout probabilities from all ConcreteDropout layers.
-        #     for layer in model.submodules:
-        #         if isinstance(layer, ConcreteDropout):
-        #             p = tf.sigmoid(layer.p_logit)
-        #             tf.summary.scalar(layer.name + "_dropout_p", p, step=epoch)
-        #     # Log meta-controller outputs using a dummy sample (using the current meta_features from the model):
-        #     dummy_meta = model.flatten(tf.zeros_like(next(train_iter)[0]))  # shape (batch, feature_dim)
-        #     meta_out = model.meta_controller(dummy_meta)
-        #     meta_names = ["interval_offset", "plasticity_mod", "homeostasis_mod", "structural_mod", "arch_threshold_adj", "lr_multiplier"]
-        #     for i, name in enumerate(meta_names):
-        #         # Log the mean value of the meta signal.
-        #         tf.summary.scalar("meta_" + name, tf.reduce_mean(meta_out[:, i]), step=epoch)
+        test_step(model, loss_fn, test_loss_metric, test_accuracy_metric, test_iter, test_steps)
+        
+        tf.print(f"Epoch {epoch+1}/{num_epochs}\nVal Loss: {current_val_loss:.4f} | Val Accuracy: {val_accuracy_metric.result():.4f}")
+        tf.print(f"Test Loss: {test_loss_metric.result():.4f} | Test Accuracy: {test_accuracy_metric.result():.4f}")
+        tf.print(f"Updated LR: {new_lr:.6e} | Homeo Int: {dynamic_homeo_interval} | Struct Int: {dynamic_structural_interval}\n"
+                 f"Arch Int: {dynamic_architecture_interval} | Vec Int: {dynamic_vectorized_interval} | Avg Grad Norm: {epoch_grad_norm:.4f}")
+        
+        # TensorBoard logging.
+        with writer.as_default():
+            tf.summary.scalar("train_loss", train_loss_metric.result(), step=epoch)
+            tf.summary.scalar("train_accuracy", train_accuracy_metric.result(), step=epoch)
+            tf.summary.scalar("val_loss", current_val_loss, step=epoch)
+            tf.summary.scalar("val_accuracy", val_accuracy_metric.result(), step=epoch)
+            tf.summary.scalar("test_loss", test_loss_metric.result(), step=epoch)
+            tf.summary.scalar("test_accuracy", test_accuracy_metric.result(), step=epoch)
+            tf.summary.scalar("avg_grad_norm", epoch_grad_norm, step=epoch)
+            tf.summary.scalar("lr_multiplier", lr_multiplier, step=epoch)
+            tf.summary.scalar("homeo_interval_offset", homeo_offset, step=epoch)
+            tf.summary.scalar("structural_interval_offset", structural_offset, step=epoch)
+            tf.summary.scalar("architecture_interval_offset", architecture_offset, step=epoch)
+            tf.summary.scalar("vectorized_interval_offset", vectorized_offset, step=epoch)
+            tf.summary.scalar("dynamic_homeo_interval", tf.cast(dynamic_homeo_interval, tf.float32), step=epoch)
+            tf.summary.scalar("dynamic_structural_interval", tf.cast(dynamic_structural_interval, tf.float32), step=epoch)
+            tf.summary.scalar("dynamic_architecture_interval", tf.cast(dynamic_architecture_interval, tf.float32), step=epoch)
+            tf.summary.scalar("dynamic_vectorized_interval", tf.cast(dynamic_vectorized_interval, tf.float32), step=epoch)
+            for layer in model.submodules:
+                if isinstance(layer, ConcreteDropout):
+                    p = tf.sigmoid(layer.p_logit)
+                    tf.summary.scalar(layer.name + "_dropout_p", p, step=epoch)
+            meta_names = ["interval_offset", "plasticity_mod", "homeostasis_mod", "structural_mod", "arch_threshold_adj", "lr_multiplier",
+                          "homeo_interval_offset", "structural_interval_offset", "architecture_interval_offset"]
+            for name in meta_names:
+                tf.summary.scalar("meta_" + name, tf.reduce_mean(meta_dict[name]), step=epoch)
                 
         # Reset metrics.
         train_loss_metric.reset_state()
         train_accuracy_metric.reset_state()
-        train_recon_loss_metric.reset_state()
         val_loss_metric.reset_state()
         val_accuracy_metric.reset_state()
-        val_recon_loss_metric.reset_state()
         test_loss_metric.reset_state()
         test_accuracy_metric.reset_state()
-        test_recon_loss_metric.reset_state()
         mean_alignment_metric.reset_state()
         mean_gating_metric.reset_state()
-
         
-        # Early stopping based on validation loss.
+        # Early stopping.
         if current_val_loss < best_val_loss - early_stop_min_delta:
             best_val_loss = current_val_loss
             patience_counter = 0
@@ -1153,8 +1166,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                     model.save(f"models/{model_name}.keras")
                 break
         
-        tf.print(f"Epoch {epoch+1} completed in {time.time() - start_time:.2f}s\n")
-
+        tf.print(f"Epoch {epoch+1} completed in {time.time()-start_time:.2f}s\n")
 # =========================================
 # Data Loading and Preprocessing Functions
 # =========================================
@@ -1222,7 +1234,7 @@ def main():
     num_classes = 10
     
     # Load data.
-    sequence = get_base_data(num_samples=500_000)
+    sequence = get_base_data(num_samples=10_000)
     input_data, labels = create_windows(sequence, window_size=window_size + 1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(input_data, labels)
     
@@ -1250,11 +1262,11 @@ def main():
     _ = model(dummy_input1, training=False)
     _ = model.critic(tf.zeros([1, memory_dim]), tf.zeros([1, num_classes]),
                      tf.zeros([1, max_units]), training=False)
-    _ = model.meta_controller(tf.zeros([1,16]), training=False)  # Updated: use meta_controller.
+    _ = model.meta_controller(tf.zeros([1,cnn_units]), training=False)  # Updated: use meta_controller.
     _ = model.neural_ode_plasticity(tf.zeros([1]), tf.zeros([1]), training=False)
     _ = model.reinforcement_layer(tf.zeros([2]), tf.zeros([2]), tf.zeros([2]), training=False)
     _ = model.chaotic_modulator(tf.zeros([2]), training=False)
-    _ = model.hidden.experts[0](tf.random.normal((1, 1280)), training=False)
+    _ = model.hidden.experts[0](tf.random.normal((1, memory_dim)), training=False)
     
     model.summary()
     
