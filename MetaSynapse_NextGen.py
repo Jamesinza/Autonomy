@@ -13,19 +13,22 @@ np.random.seed(42)
 tf.random.set_seed(42)
 
 # =============================================================================
-# 1. Learned Activation Function: Dynamically adjust weights based on input context
+# 1. Learned Activations combined with Quantum-Inspired Stochastic Activation
+#    Dynamically adjust weights based on input context
 # =============================================================================
-class LearnedActivation(tf.keras.layers.Layer):
-    def __init__(self, **kwargs):
-        super(LearnedActivation, self).__init__(**kwargs)
+class LearnedQuantumActivation(tf.keras.layers.Layer):
+    def __init__(self, temperature=0.5, **kwargs):
+        super(LearnedQuantumActivation, self).__init__(**kwargs)
+        self.temperature = temperature  # Controls the noise intensity
         
     def build(self, input_shape):
         self.w = self.add_weight(name='activation_weights', shape=(9,),
                                  initializer='ones', trainable=True)
-        super(LearnedActivation, self).build(input_shape)
+        super(LearnedQuantumActivation, self).build(input_shape)
     
-    # @tf.function
-    def call(self, inputs):
+    
+    def call(self, inputs, training=True):
+        # Compute multiple activations
         sig = tf.keras.activations.sigmoid(inputs)
         elu = tf.keras.activations.elu(inputs)
         tanh = tf.keras.activations.tanh(inputs)
@@ -34,12 +37,26 @@ class LearnedActivation(tf.keras.layers.Layer):
         gelu = tf.keras.activations.gelu(inputs)
         selu = tf.keras.activations.selu(inputs)
         mish = tf.keras.activations.mish(inputs)
-        linear = 0.0
+        linear = 0.0  # Acts as a "do-nothing" activation
+
+        # Compute softmax-weighted activation mixture
         weights = tf.nn.softmax(self.w)
-        results = (weights[0]*sig + weights[1]*elu + weights[2]*tanh +
-                   weights[3]*relu + weights[4]*silu + weights[5]*gelu +
-                   weights[6]*selu + weights[7]*mish + weights[8]*linear)
-        return results
+        base_activation = (weights[0]*sig + weights[1]*elu + weights[2]*tanh +
+                           weights[3]*relu + weights[4]*silu + weights[5]*gelu +
+                           weights[6]*selu + weights[7]*mish + weights[8]*linear)
+        
+        # Generate stochastic noise (quantum-inspired phase noise)
+        phase_noise = tf.random.normal(tf.shape(inputs)) * self.temperature
+
+        # Apply noise based on the sign of base activation
+        if training:  # Apply stochasticity only during training
+            noisy_activation = tf.where(base_activation > 0, 
+                                        base_activation + phase_noise, 
+                                        base_activation - tf.abs(phase_noise))
+        else:
+            noisy_activation = base_activation  # No noise during inference
+        
+        return noisy_activation
 
 # =============================================================================
 # 2. Recurrent Plasticity Controller with Self-Attention
@@ -97,7 +114,7 @@ class UnsupervisedFeatureExtractor(tf.keras.Model):
         y = self.dec_upconv2(y1)
         return self.dec_output(y)
 
-    # @tf.function
+    
     def call(self, inputs):
         x1, latent, flat_latent = self.encode(inputs)
         reconstruction = self.decode(x1, latent)
@@ -118,7 +135,7 @@ class DynamicConnectivity(tf.keras.layers.Layer):
         ])
         super(DynamicConnectivity, self).build(input_shape)
         
-    # @tf.function
+    
     def call(self, neuron_features):
         connectivity = self.attention_net(neuron_features)
         return connectivity
@@ -179,7 +196,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         self.branch_gating = tf.keras.layers.Dense(self.num_branches, activation='softmax', name="branch_gating")
         super(DynamicPlasticDenseDendritic, self).build(input_shape)
 
-    # @tf.function
+    
     def call(self, inputs):
         # Vectorized branch computation.
         w_mod = self.w * tf.math.sigmoid(self.delay)  # (input_dim, max_units, num_branches)
@@ -205,7 +222,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         self.neuron_activation_avg.assign(new_avg)
         return a
 
-    # @tf.function
+    
     def plasticity_update(self, pre_activity, post_activity, reward):
         pre_mean = tf.reduce_mean(pre_activity)
         post_mean = tf.reduce_mean(post_activity)
@@ -232,12 +249,12 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         return tf.cond(tf.greater_equal(self.feature_history_index, seq_len),
                        do_update, no_update)
 
-    # @tf.function
+    
     def apply_plasticity(self, plasticity_delta_w, plasticity_delta_delay):
         self.w.assign_add(plasticity_delta_w)
         self.delay.assign_add(plasticity_delta_delay)
 
-    # @tf.function
+    
     def apply_homeostatic_scaling(self):
         avg_w = tf.reduce_mean(tf.abs(self.w))
         new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
@@ -251,7 +268,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         self.delay.assign(self.delay * scaling_factor_delay)
         self.avg_delay_magnitude.assign(avg_delay)
 
-    # @tf.function
+    
     def apply_structural_plasticity(self):
         pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
         self.w.assign(pruned_w)
@@ -274,7 +291,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
                                self.delay)
         self.delay.assign(new_delays)
 
-    # @tf.function
+    
     def adjust_prune_threshold(self):
         self.prune_threshold.assign(tf.cond(tf.greater(self.sparsity, 0.8),
                                               lambda: self.prune_threshold * 1.05,
@@ -282,7 +299,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
                                                               lambda: self.prune_threshold * 0.95,
                                                               lambda: self.prune_threshold)))
 
-    # @tf.function
+    
     def adjust_add_prob(self):
         self.add_prob.assign(tf.cond(tf.less(self.avg_weight_magnitude, 0.01),
                                        lambda: self.add_prob * 1.05,
@@ -290,7 +307,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
                                                        lambda: self.add_prob * 0.95,
                                                        lambda: self.add_prob)))
 
-    # @tf.function
+    
     def apply_architecture_modification(self):
         mask_after_prune = tf.where(
             tf.logical_and(tf.equal(self.neuron_mask, 1.0),
@@ -337,7 +354,7 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         ])
         super(MoE_DynamicPlasticLayer, self).build(input_shape)
         
-    # @tf.function
+    
     def call(self, inputs, latent=None):
         expert_outputs = [expert(inputs) for expert in self.experts]
         expert_stack = tf.stack(expert_outputs, axis=-1)  # (batch, features, num_experts)
@@ -367,7 +384,7 @@ class EpisodicMemory(tf.keras.layers.Layer):
         self.read_layer = tf.keras.layers.Dense(self.memory_size, activation='softmax')
         super(EpisodicMemory, self).build(input_shape)
 
-    # @tf.function
+    
     def call(self, inputs):
         attention = self.read_layer(inputs)  # (batch, memory_size)
         read_vector = tf.matmul(tf.expand_dims(attention, 1), self.memory)
@@ -391,15 +408,16 @@ class PlasticityModelMoE(tf.keras.Model):
         self.cnn3 = tf.keras.layers.Conv2D(units*2, (3,3), activation='relu', padding='same')
         self.drop = tf.keras.layers.Dropout(0.9)
         self.flatten = tf.keras.layers.Flatten()
-        self.dens = tf.keras.layers.Dense(units, activation=LearnedActivation())
+        self.dens = tf.keras.layers.Dense(units, activation=LearnedQuantumActivation())
         self.unsupervised_extractor = UnsupervisedFeatureExtractor(units)
         self.episodic_memory = EpisodicMemory(memory_size, units)
         self.hidden = MoE_DynamicPlasticLayer(num_experts, max_units, initial_units, plasticity_controller)
-        self.feature_combiner = tf.keras.layers.Dense(units, activation='relu')
+        self.feature_combiner = tf.keras.layers.Dense(units, activation=LearnedQuantumActivation())
         self.classification_head = tf.keras.layers.Dense(num_classes, activation='softmax')
         self.uncertainty_head = tf.keras.layers.Dense(1, activation='sigmoid')
     
     # Do not decorate call to avoid retracing issues.
+    
     def call(self, x, training=False):
         latent, reconstruction = self.unsupervised_extractor(x)
         memory_read = self.episodic_memory(latent)
@@ -555,7 +573,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     patience_counter = 0
     best_weights = None
 
-    # @tf.function(experimental_compile=False)
+    # @tf.function
     def train_step(images, labels, plasticity_weight, global_step):
         with tf.GradientTape() as tape:
             predictions, hidden, reconstruction, uncertainty, latent = model(images, training=True)
@@ -692,10 +710,10 @@ def main():
     w = 16
     cnn_units = h*w
     window_size = h * w
-    learning_rate = 1e-3
+    learning_rate = 1e-4
     
     # Load data.
-    sequence = get_base_data(num_samples=10_000)
+    sequence = get_base_data(num_samples=1_000_000)
     inputs, labels = create_windows(sequence, window_size=window_size+1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
     
@@ -716,13 +734,14 @@ def main():
     
     model = PlasticityModelMoE(h, w, plasticity_controller, units=cnn_units, 
                                num_experts=experts, max_units=max_units, initial_units=initial_units, num_classes=10)
+    model.load_weights("model_weights/MetaSynapse_NextGen_v6c/model.weights.h5", skip_mismatch=True)
     ae_model = model.unsupervised_extractor
     dummy_input = tf.zeros((1, h, w, 1))
     _ = model(dummy_input, training=False)
     _ = ae_model(dummy_input, training=False)
     model.summary()
     
-    model_name = "MetaSynapse_NextGen_v6b"
+    model_name = "MetaSynapse_NextGen_v6c"
         
     train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
                 num_epochs=epochs, homeostasis_interval=13, architecture_update_interval=55,
