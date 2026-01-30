@@ -1,6 +1,6 @@
 import tensorflow as tf
-import numpy as np
 import pandas as pd
+import numpy as np
 import random
 import math
 
@@ -99,6 +99,9 @@ class UnsupervisedFeatureExtractor(tf.keras.Model):
         latent = self.encoder(x)
         reconstruction = self.decoder(latent)
         return latent, reconstruction
+        
+    def compute_output_shape(self, input_shape):
+        return input_shape        
 
 # =============================================================================
 # 4. Dynamic Connectivity: Using learned activation and unsupervised latent cues.
@@ -188,7 +191,6 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         alpha = 0.9
         new_avg = alpha * self.neuron_activation_avg + (1 - alpha) * batch_mean
         self.neuron_activation_avg.assign(new_avg)
-        
         return a
 
     def plasticity_update(self, pre_activity, post_activity, reward):
@@ -221,14 +223,14 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
 
     def apply_plasticity(self, plasticity_delta):
         self.w.assign_add(plasticity_delta)
-    
+    @tf.function
     def apply_homeostatic_scaling(self):
         avg_w = tf.reduce_mean(tf.abs(self.w))
         new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
         scaling_factor = new_target / (avg_w + 1e-6)
         self.w.assign(self.w * scaling_factor)
         self.avg_weight_magnitude.assign(avg_w)
-    
+    @tf.function
     def apply_structural_plasticity(self):
         pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
         self.w.assign(pruned_w)
@@ -241,19 +243,19 @@ class DynamicPlasticDenseAdvancedHyperV2(tf.keras.layers.Layer):
         self.sparsity.assign(tf.reduce_mean(tf.cast(tf.equal(self.w, 0.0), tf.float32)))
         self.adjust_prune_threshold()
         self.adjust_add_prob()
-
+    @tf.function
     def adjust_prune_threshold(self):
         if self.sparsity > 0.8:
             self.prune_threshold.assign(self.prune_threshold * 1.05)
         elif self.sparsity < 0.3:
             self.prune_threshold.assign(self.prune_threshold * 0.95)
-
+    @tf.function
     def adjust_add_prob(self):
         if self.avg_weight_magnitude < 0.01:
             self.add_prob.assign(self.add_prob * 1.05)
         elif self.avg_weight_magnitude > 0.1:
             self.add_prob.assign(self.add_prob * 0.95)
-    
+    @tf.function
     def apply_architecture_modification(self):
         # Prune: For active neurons, set mask to 0 if their running average activation is below threshold.
         mask_after_prune = tf.where(
@@ -323,65 +325,103 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         super(MoE_DynamicPlasticLayer, self).build(input_shape)
         
     @tf.function
-    def call(self, inputs):
+    def call(self, inputs, latent=None):
         # Process the input through each expert.
         expert_outputs = [expert(inputs) for expert in self.experts]
         # Stack expert outputs: shape (batch, features, num_experts)
         expert_stack = tf.stack(expert_outputs, axis=-1)
+        # If latent is provided, concatenate it with inputs.
+        if latent is not None:
+            gating_input = tf.concat([inputs, latent], axis=-1)
+        else:
+            gating_input = inputs        
         # Get gating weights: shape (batch, num_experts)
-        gate_weights = self.gating_network(inputs)
+        gate_weights = self.gating_network(gating_input)
         # Expand dims for broadcasting: (batch, 1, num_experts)
         gate_weights = tf.expand_dims(gate_weights, axis=1)
         # Compute a weighted sum over experts.
         output = tf.reduce_sum(expert_stack * gate_weights, axis=-1)
-        return output        
+        return output
+        
+# =============================================================================
+# 6. Integrate Episodic Memory for Continual Learning
+# =============================================================================        
+class EpisodicMemory(tf.keras.layers.Layer):
+    def __init__(self, memory_size, memory_dim, **kwargs):
+        super(EpisodicMemory, self).__init__(**kwargs)
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+
+    def build(self, input_shape):
+        self.memory = self.add_weight(
+            shape=(self.memory_size, self.memory_dim),
+            initializer='glorot_uniform',
+            trainable=False,
+            name='episodic_memory'
+        )
+        self.write_layer = tf.keras.layers.Dense(self.memory_dim, activation='tanh')
+        self.read_layer = tf.keras.layers.Dense(self.memory_dim, activation='softmax')
+        super(EpisodicMemory, self).build(input_shape)
+
+    @tf.function
+    def call(self, inputs):
+        # Read: Compute attention over memory based on inputs.
+        attention = self.read_layer(inputs)  # (batch, memory_dim)
+        read_vector = tf.matmul(tf.expand_dims(attention, 1), self.memory)
+        read_vector = tf.squeeze(read_vector, axis=1)
+        # Write: Update a random memory slot with a transformed input.
+        write_vector = self.write_layer(inputs)
+        idx = tf.random.uniform(shape=[], maxval=self.memory_size, dtype=tf.int32)
+        memory_update = tf.tensor_scatter_nd_update(self.memory, [[idx]], [write_vector])
+        self.memory.assign(memory_update)
+        return read_vector
+        
 
 # =============================================================================
-# 6. Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer.
+# 7. Full Model with Integrated Unsupervised Branch and Dynamic Plastic Dense Layer.
 # =============================================================================
 class PlasticityModelMoE(tf.keras.Model):
-    def __init__(self, h, w, plasticity_controller, num_experts=2, max_units=128, initial_units=32, num_classes=10, **kwargs):
+    def __init__(self, h, w, plasticity_controller, num_experts=2, max_units=128, 
+                 initial_units=32, num_classes=10, memory_size=100, memory_dim=16, **kwargs):
         super(PlasticityModelMoE, self).__init__(**kwargs)
-        # Unsupervised branch (autoencoder) remains the same.
         self.unsupervised_extractor = UnsupervisedFeatureExtractor(h, w)
         self.flatten = tf.keras.layers.Flatten()
-        # Replace the single dynamic plastic layer with the MoE version.
+        self.episodic_memory = EpisodicMemory(memory_size, memory_dim)
         self.hidden = MoE_DynamicPlasticLayer(num_experts, max_units, initial_units, plasticity_controller)
-        # Main classification head.
+        self.feature_combiner = tf.keras.layers.Dense(128, activation='relu')
         self.classification_head = tf.keras.layers.Dense(num_classes, activation='softmax')
-        # Additional head for, e.g., uncertainty estimation.
         self.uncertainty_head = tf.keras.layers.Dense(1, activation='sigmoid')
+    
     @tf.function
     def call(self, x, training=False):
-        # Get latent representation and reconstruction.
         latent, reconstruction = self.unsupervised_extractor(x)
+        memory_read = self.episodic_memory(latent)
         x_flat = self.flatten(x)
-        # Process through the MoE dynamic plastic layer.
-        hidden_act = self.hidden(x_flat)
-        # Multihead outputs:
-        class_out = self.classification_head(hidden_act)
-        uncertainty = self.uncertainty_head(hidden_act)
-        # You now have three outputs:
-        #   - class_out: for supervised classification,
-        #   - reconstruction: for unsupervised reconstruction loss,
-        #   - uncertainty: for a side task (or to inform neuromodulation).
-        return class_out, hidden_act, reconstruction, uncertainty
+        combined_input = tf.concat([x_flat, latent, memory_read], axis=-1)
+        hidden_act = self.hidden(combined_input)
+        combined = tf.concat([hidden_act, latent, memory_read], axis=-1)
+        combined = self.feature_combiner(combined)
+        class_out = self.classification_head(combined)
+        uncertainty = self.uncertainty_head(combined)
+        return class_out, hidden_act, reconstruction, uncertainty, latent
+
 
 # =============================================================================
-# 7. Training Loop: Incorporates classification loss, unsupervised (reconstruction) loss,
+# 8. Training Loop: Incorporates classification loss, unsupervised (reconstruction) loss,
 #    recurrent meta-plasticity updates (with unsupervised influence), chaotic modulation,
 #    and architecture modifications.
 # =============================================================================
 def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=1000,
                 homeostasis_interval=13, architecture_update_interval=21,
                 plasticity_update_interval=8, plasticity_start_epoch=3,
-                early_stop_patience=10, early_stop_min_delta=1e-4, learning_rate=1e-3, **kwargs):
+                early_stop_patience=100, early_stop_min_delta=1e-4, learning_rate=1e-3, **kwargs):
                 
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
+    ae_optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
+    
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
     recon_loss_fn = tf.keras.losses.MeanSquaredError()
     uncertainty_loss_fn = tf.keras.losses.MeanSquaredError()
-    
-    optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
     
     # Global variables controlled by the recurrent plasticity controller.
     global_plasticity_weight_multiplier = tf.Variable(0.5, trainable=False, dtype=tf.float32)
@@ -425,8 +465,10 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
         # -----------------------
         for step in range(train_steps):
             images, labels = next(train_iter)        
-            with tf.GradientTape() as tape:
-                predictions, hidden, reconstruction, uncertainty = model(images, training=True)
+            with tf.GradientTape(persistent=True) as tape:
+                predictions, hidden, reconstruction, uncertainty, latent = model(images, training=True)
+                # hidden, reconstruction = model.unsupervised_extractor(images, training=True)
+                
                 loss = loss_fn(labels, predictions)
                 # Unsupervised reconstruction loss.
                 recon_loss = recon_loss_fn(images, reconstruction)
@@ -440,6 +482,9 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                 
             grads = tape.gradient(total_loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            
+            ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
+            ae_optimizer.apply_gradients(zip(ae_grads, model.unsupervised_extractor.trainable_variables))
             
             batch_errors.append(loss.numpy())
             train_loss_metric(loss)
@@ -458,7 +503,9 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
             if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
                 for expert in model.hidden.experts:
                     expert_reward = compute_expert_reward(images, reconstruction, labels, predictions)
-                    neuromod_signal = compute_neuromodulatory_signal(predictions, expert_reward)
+                    base_neuromod_signal = compute_neuromodulatory_signal(predictions, expert_reward)
+                    latent_signal = tf.reduce_mean(compute_latent_mod(latent))
+                    neuromod_signal = base_neuromod_signal * latent_signal
                     plasticity_delta = expert.plasticity_update(pre_activity, post_activity, expert_reward)
                     if tf.reduce_sum(tf.abs(plasticity_delta)) > 0:
                         plasticity_delta *= plasticity_weight * neuromod_signal
@@ -494,7 +541,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
         # -----------------------
         for step in range(val_steps):
             val_images, val_labels = next(val_iter)         
-            val_predictions, _, val_reconstruction, _ = model(val_images, training=False)
+            val_predictions, _, val_reconstruction, _, _ = model(val_images, training=False)
             val_loss = loss_fn(val_labels, val_predictions)
             val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
             
@@ -517,7 +564,7 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
         # -----------------------
         for step in range(test_steps):
             test_images, test_labels = next(test_iter)        
-            test_predictions, _, test_reconstruction, _ = model(test_images, training=False)
+            test_predictions, _, test_reconstruction, _, _ = model(test_images, training=False)
             test_loss = loss_fn(test_labels, test_predictions)
             test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
 
@@ -549,12 +596,13 @@ def train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_s
                 if best_weights is not None:
                     print("Restoring best weights and saving model.\n")
                     model.set_weights(best_weights)
-                    model.save("models/MetaSynapse_NextGen_v3d.keras")
+                    model.save("models/MetaSynapse_NextGen_v3e.keras")
+                    model.unsupervised_extractor.save("models/unsupervised_extractor_v3e.keras")
                     patience_counter = 0
                 #break  # Exit the epoch loop.
 
 # =============================================================================
-# 8. Helper functions for chaotic modulation, neuromodulatory signal, and reinforcement signals.
+# 9. Helper functions for various signals.
 # =============================================================================
 def chaotic_modulation(c, r=3.8):
     # Simple logistic map.
@@ -595,7 +643,14 @@ def compute_expert_reward(expert_hidden, expert_reconstruction, labels, predicti
     uncertainty = tf.reduce_mean(entropy)
     # Combine the metrics into a specialized reward signal.
     expert_reward = tf.sigmoid(-recon_loss) + 0.5 * tf.sigmoid(novelty) + 0.5 * tf.sigmoid(-uncertainty)
-    return expert_reward    
+    return expert_reward
+    
+def compute_latent_mod(inputs):
+    latent_modulator = tf.keras.Sequential([
+        tf.keras.layers.Dense(16, activation='relu'),
+        tf.keras.layers.Dense(1, activation='sigmoid')  # Outputs a value between 0 and 1.
+    ])(inputs)
+    return latent_modulator
     
 # =============================================================================
 # 9. Data loading functions.
@@ -652,7 +707,7 @@ def main():
     learning_rate=1e-4
     
     # Load data.
-    sequence = get_real_data(num_samples=10_000)
+    sequence = get_real_data(num_samples=1_000)
     inputs, labels = create_windows(sequence, window_size=window_size+1)
     (inp_train, lbl_train), (inp_val, lbl_val), (inp_test, lbl_test) = split_dataset(inputs, labels)
     
@@ -674,11 +729,14 @@ def main():
     
     # Instantiate the new MoE-based model.
     model = PlasticityModelMoE(h, w, plasticity_controller, num_experts=experts, max_units=max_units, initial_units=initial_units, num_classes=10)
+    ae_model = model.unsupervised_extractor
+    # latent_mod = model.latent_modulator
     dummy_input = tf.zeros((1, h, w, 1))
     _ = model(dummy_input, training=False)
+    _ = ae_model(dummy_input, training=False)
+    # _ = latent_mod(dummy_input, training=False)
     model.summary()
-    model.load_weights('model_weights/MetaSynapse_NextGen_v3c/model.weights.h5')
-    
+        
     # Train the model.
     train_model(model, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps, num_epochs=epochs,
                 homeostasis_interval=5, architecture_update_interval=21,
