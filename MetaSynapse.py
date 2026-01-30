@@ -220,21 +220,29 @@ def create_tf_dataset(inputs, labels, batch_size=128, shuffle=False, repeat_epoc
 # =============================================================================
 # 6. Training loop with hypernetwork integration.
 # =============================================================================
-def train_model(model, ds_train, ds_val, ds_test, num_epochs=5, homeostasis_interval=100):
+def train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_interval=100,
+                plasticity_start_epoch=15, plasticity_update_interval=10):
     loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
-    optimizer.build(model.trainable_variables)
+    optimizer = tf.keras.optimizers.AdamW(learning_rate=0.001)
     
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
     
     global_step = 0
     for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        # Delay plasticity until after baseline period and ramp-up gradually.
+        if epoch < plasticity_start_epoch:
+            plasticity_weight = 0.0
+        else:
+            plasticity_weight = (epoch - plasticity_start_epoch + 1) / (num_epochs - plasticity_start_epoch + 1)
+            # Even further scale down the plasticity update initially.
+            plasticity_weight *= 0.5
+
         for images, labels in ds_train:
             with tf.GradientTape() as tape:
                 predictions, hidden = model(images, training=True)
                 loss = loss_fn(labels, predictions)
+            # Standard gradient update.
             grads = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
             
@@ -245,10 +253,20 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=5, homeostasis_inte
             x_flat = model.flatten(images)
             pre_activity = tf.reduce_mean(x_flat, axis=0)
             post_activity = tf.reduce_mean(hidden, axis=0)
-            reward = tf.sigmoid(-loss)
+            # Rescale reward to soften plasticity update effect.
+            reward = 0.1 * tf.sigmoid(-loss)
             
-            plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
-            model.hidden.apply_plasticity(plasticity_delta)
+            # Only apply plasticity update at defined intervals.
+            if plasticity_weight > 0 and global_step % plasticity_update_interval == 0:
+                plasticity_delta = model.hidden.plasticity_update(pre_activity, post_activity, reward)
+                # Scale the plasticity update by the current plasticity weight.
+                plasticity_delta *= plasticity_weight
+                model.hidden.apply_plasticity(plasticity_delta)
+                
+                # Log some plasticity statistics.
+                delta_mean = tf.reduce_mean(tf.abs(plasticity_delta))
+                delta_std = tf.math.reduce_std(plasticity_delta)
+                # print(f"Step {global_step}: Plasticity delta mean = {delta_mean:.6f}, std = {delta_std:.6f}")
             
             if global_step % homeostasis_interval == 0:
                 model.hidden.apply_homeostatic_scaling()
@@ -256,7 +274,8 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=5, homeostasis_inte
             
             global_step += 1
         
-        print(f"Train Loss : {train_loss.result():.4f}, Train Accuracy : {train_accuracy.result():.4f}")
+        print(f"\nEpoch {epoch+1}/{num_epochs}\nTrain Loss : {train_loss.result():.4f}, "
+              f"Train Accuracy : {train_accuracy.result():.4f}, Plasticity Weight : {plasticity_weight:.4f}")
         train_loss.reset_state()
         train_accuracy.reset_state()
         
@@ -280,8 +299,8 @@ def train_model(model, ds_train, ds_val, ds_test, num_epochs=5, homeostasis_inte
             test_accuracy_metric(labels, predictions)
         print(f"Test Loss  : {test_loss_metric.result():.4f}, Test Accuracy  : {test_accuracy_metric.result():.4f}")
     
-    model.save("models/MetaSynapse_v6.keras")
-
+    model.save("models/MetaSynapse_v6b.keras")
+    
 # =============================================================================
 # 7. Main: Create dataset, instantiate models, and train.
 # =============================================================================
@@ -311,7 +330,7 @@ def main():
     model.summary()
     
     # Now instantiate the optimizer after all variables are built.
-    train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_interval=10)
+    train_model(model, ds_train, ds_val, ds_test, num_epochs=100, homeostasis_interval=100)
 
 if __name__ == '__main__':
     main()
