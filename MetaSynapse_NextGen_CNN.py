@@ -274,6 +274,7 @@ class PlasticityModelHyperV2(tf.keras.Model):
     def __init__(self, plasticity_controller, max_units=256, initial_units=128, num_classes=10, **kwargs):
         super(PlasticityModelHyperV2, self).__init__(**kwargs)
         self.unsupervised_extractor = UnsupervisedFeatureExtractor(latent_dim=32)
+        self.ma = MultiAgentDynamicsLayer(num_agents=12, units=32, name='multi_agent')
         self.cnn1 = tf.keras.layers.Conv2D(64, (3,3), activation=LearnedActivation(), padding='same')
         self.cnn2 = tf.keras.layers.Conv2D(64, (3,3), activation=LearnedActivation(), padding='same')
         self.drop1 = tf.keras.layers.Dropout(0.5)
@@ -291,7 +292,8 @@ class PlasticityModelHyperV2(tf.keras.Model):
         cnn2 = self.cnn2(drop1)
         drop2 = self.drop2(cnn2)
         x_flat = self.flatten(drop2)
-        hidden_act = self.hidden(x_flat)
+        ma = self.ma(x_flat)
+        hidden_act = self.hidden(ma)
         drop3 = self.drop3(hidden_act)
         output = self.out(drop3)
         return output, hidden_act, reconstruction
@@ -388,6 +390,68 @@ class MemoryBankLayer(tf.keras.layers.Layer):
         output_shape = list(input_shape)
         output_shape[-1] = self.units
         return tuple(output_shape)
+        
+        
+# ---------- PlasticDense Layer with Hebbian Updates ----------
+class PlasticDense(tf.keras.layers.Layer):
+    def __init__(self, units, hebbian_rate=1e-5, use_layer_norm=True, **kwargs):
+        super(PlasticDense, self).__init__(**kwargs)
+        self.units = units
+        self.hebbian_rate = hebbian_rate
+        self.use_bias = True
+        self.use_layer_norm = use_layer_norm
+
+    def build(self, input_shape):
+        last_dim = int(input_shape[-1])
+        self.activation_fn = LearnedActivation()
+        self.layer_norm = tf.keras.layers.LayerNormalization() if self.use_layer_norm else None
+        self.kernel = self.add_weight(
+            shape=(last_dim, self.units),
+            initializer='glorot_uniform',
+            trainable=True,
+            name='kernel',
+        )
+        if self.use_bias:
+            self.bias = self.add_weight(
+                shape=(self.units,),
+                initializer='zeros',
+                trainable=True,
+                name='bias'
+            )
+        else:
+            self.bias = None
+        super(PlasticDense, self).build(input_shape)
+
+    def call(self, inputs, modulation=None, training=None):
+        output = tf.matmul(inputs, self.kernel)
+        if self.use_bias:
+            output = output + self.bias
+        if self.activation_fn is not None:
+            output = self.activation_fn(output)
+        if self.layer_norm is not None:
+            output = self.layer_norm(output)            
+        if training:
+            adapted_hebbian = adaptive_hebbian_rate(self.kernel, self.hebbian_rate)
+            mod_hebbian = self.hebbian_rate * modulation if modulation is not None else adapted_hebbian
+            delta = self.compute_hebbian_delta(inputs, output)
+            self.kernel.assign_add(mod_hebbian * delta)
+        return output
+    
+    def compute_hebbian_delta(self, inputs, output):
+        if len(inputs.shape) == 3:
+            inp_reduced = tf.reduce_mean(inputs, axis=1)
+            out_reduced = tf.reduce_mean(output, axis=1)
+        else:
+            inp_reduced = inputs
+            out_reduced = output
+        batch_size = tf.cast(tf.shape(inp_reduced)[0], tf.float32)
+        delta = tf.einsum('bi,bo->io', inp_reduced, out_reduced) / batch_size
+        return delta
+        
+    def compute_output_shape(self, input_shape):
+        output_shape = list(input_shape)
+        output_shape[-1] = self.units
+        return tuple(output_shape)        
         
 # =============================================================================
 # 8. Training Loop: Incorporates classification loss, unsupervised (reconstruction) loss,
@@ -623,4 +687,3 @@ def main():
     
 if __name__ == '__main__':
     main()
-
