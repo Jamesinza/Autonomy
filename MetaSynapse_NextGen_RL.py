@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import math
 import random
+import time
 
 # Set seeds for reproducibility.
 np.random.seed(42)
@@ -83,7 +84,7 @@ class DynamicConnectivity(tf.keras.layers.Layer):
         
     def build(self, input_shape):
         super(DynamicConnectivity, self).build(input_shape)
-    
+
     def call(self, neuron_features):
         connectivity = self.attention_net(neuron_features)
         return connectivity
@@ -184,6 +185,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         self.neuron_activation_avg.assign(new_avg)
         return a
 
+    @tf.function
     def vectorized_plasticity_update(self, pre_activity, post_activity, reward):
         # Compute global statistics.
         pre_mean = tf.reduce_mean(pre_activity)
@@ -206,6 +208,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
     #     self.w.assign_add(plasticity_delta_w)
     #     self.delay.assign_add(plasticity_delta_delay)
 
+    @tf.function
     def apply_homeostatic_scaling(self):
         avg_w = tf.reduce_mean(tf.abs(self.w))
         new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
@@ -218,6 +221,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
         self.delay.assign(self.delay * scaling_factor_delay)
         self.avg_delay_magnitude.assign(avg_delay)
 
+    @tf.function
     def apply_structural_plasticity(self):
         pruned_w = tf.where(tf.abs(self.w) < self.prune_threshold, tf.zeros_like(self.w), self.w)
         self.w.assign(pruned_w)
@@ -241,6 +245,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
             self.delay)
         self.delay.assign(new_delays)
 
+    @tf.function
     def adjust_prune_threshold(self):
         self.prune_threshold.assign(tf.cond(
             tf.greater(self.sparsity, 0.8),
@@ -249,6 +254,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
                             lambda: self.prune_threshold * self.prune_max,
                             lambda: self.prune_threshold)))
 
+    @tf.function
     def adjust_add_prob(self):
         self.add_prob.assign(tf.cond(
             tf.less(self.avg_weight_magnitude, 0.01),
@@ -257,6 +263,7 @@ class DynamicPlasticDenseDendritic(tf.keras.layers.Layer):
                             lambda: self.add_prob * self.prob_max,
                             lambda: self.add_prob)))
 
+    @tf.function
     def apply_architecture_modification(self):
         mask_after_prune = tf.where(
             tf.logical_and(tf.equal(self.neuron_mask, 1.0),
@@ -315,6 +322,7 @@ class MoE_DynamicPlasticLayer(tf.keras.layers.Layer):
         output = tf.reduce_sum(expert_stack * gate_weights, axis=-1)
         return output
 
+    @tf.function
     def batch_plasticity_update(self, pre_activity, post_activity, reward, neuromod_signal,
                                 scale_factor, bias_adjustment, update_gate, gating_signal):
         # Stack weights and delays from all experts.
@@ -433,6 +441,7 @@ class NeuralODEPlasticity(tf.keras.layers.Layer):
             context_tiled = None
 
         # Define the derivative function.
+        @tf.function
         def ode_fn(t_val, y_val):
             # Reshape y to (N, 1) for processing.
             y_reshaped = tf.reshape(y_val, [-1, 1])
@@ -693,7 +702,7 @@ class MetacognitiveCritic(tf.keras.layers.Layer):
             trainable=True,
             name='meta_threshold')
         super(MetacognitiveCritic, self).build(input_shape)
-    
+
     def call(self, latent, predictions, hidden_activation, uncertainty):
         # Process each modality.
         latent_feat = self.latent_dense(latent)
@@ -735,6 +744,7 @@ class ChaoticModulation(tf.keras.layers.Layer):
             name='reward_scale_fact')
         super(ChaoticModulation, self).build(input_shape)
 
+    # @tf.function
     def call(self, c):
         # Logistic map: new value = r * c * (1 - c)
         chaotic_factor = self.r * c * (1 - c)
@@ -793,7 +803,7 @@ class LearnedQuantumActivation(tf.keras.layers.Layer):
             trainable=True,
             name='activation_temperature')
         super(LearnedQuantumActivation, self).build(input_shape)
-    
+
     def call(self, inputs, training=True):
         # Compute candidate activations.
         sig = tf.keras.activations.sigmoid(inputs)
@@ -866,7 +876,7 @@ class UnsupervisedFeatureExtractor(tf.keras.Model):
         y1 = self.dec_concat1([x1, y1])
         y = self.dec_upconv2(y1)
         return self.dec_output(y)
-    
+
     def call(self, inputs):
         x1, latent, flat_latent = self.encode(inputs)
         reconstruction = self.decode(x1, latent)
@@ -985,6 +995,7 @@ class PlasticityModelMoE(tf.keras.Model):
             name="uncertainty_loss_weight")
         super(PlasticityModelMoE, self).build(input_shape)        
 
+    # @tf.function
     def call(self, x, training=False):
         latent, reconstruction = self.unsupervised_extractor(x)
         memory_read = self.episodic_memory(latent)
@@ -1029,6 +1040,7 @@ class PlasticityModelMoE(tf.keras.Model):
 # =========================================
 # Helper Functions for Signals and Rewards
 # =========================================
+@tf.function
 def compute_neuromodulatory_signal(predictions, external_reward=0.0):
     # Force computations to float32.
     predictions = tf.cast(predictions, tf.float32)
@@ -1037,6 +1049,7 @@ def compute_neuromodulatory_signal(predictions, external_reward=0.0):
     modulation = tf.sigmoid(tf.cast(external_reward, tf.float32) + tf.reduce_mean(entropy))
     return modulation
 
+# @tf.function    
 def compute_latent_mod(inputs):
     latent_modulator = tf.keras.Sequential([
         tf.keras.layers.Dense(16, activation='relu', name='latmod_dens1'),
@@ -1064,7 +1077,7 @@ def critic_alignment_loss(episodic_memory, current_predictions):
 def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
                 num_epochs=1000, homeostasis_interval=10, architecture_update_interval=2,
                 plasticity_update_interval=10, plasticity_start_epoch=1,
-                early_stop_patience=100, early_stop_min_delta=1e-4, learning_rate=1e-3,
+                early_stop_patience=10, early_stop_min_delta=1e-4, learning_rate=1e-3,
                 critic_loss_weight=0.1):
     # Set up optimizers.
     optimizer = tf.keras.optimizers.AdamW(learning_rate=learning_rate)
@@ -1094,11 +1107,12 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
     best_val_loss = np.inf
     best_val_recon_loss = np.inf
     patience_counter = 0
-    recon_patience_counter = 0
+    recon_patience_counter = 10
     best_weights = None
     recon_best_weights = None
 
     # Integrated training step: one forward/backward pass for both model and critic.
+    @tf.function
     def train_step(images, labels, plasticity_weight_val):
         with tf.GradientTape(persistent=True) as tape:
             # Forward pass through the base model.
@@ -1107,18 +1121,13 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
              gating_signal, alignment_score) = model(images, training=True)
             
             # Compute main losses.
-            loss = loss_fn(labels, predictions)
+            loss_value = loss_fn(labels, predictions)
             recon_loss = recon_loss_fn(images, reconstruction)
             mean_uncertainty = tf.reduce_mean(uncertainty)
             uncertainty_loss = tf.reduce_mean(tf.square(uncertainty - mean_uncertainty))
-            total_loss = loss + model.recon_loss_weight*recon_loss + model.uncertainty_loss_weight*uncertainty_loss
-
-            # Compute critic outputs and loss.
-            c_loss = critic_alignment_loss(episodic_memory, predictions)
-            total_loss += critic_loss_weight * alignment_score
 
         # Update the base model.
-        model_grads = tape.gradient(total_loss, model.trainable_variables)
+        model_grads = tape.gradient(loss_value, model.trainable_variables)
         optimizer.apply_gradients(zip(model_grads, model.trainable_variables))
         # Update autoencoder.
         ae_grads = tape.gradient(recon_loss, model.unsupervised_extractor.trainable_variables)
@@ -1128,10 +1137,33 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         critic_optimizer.apply_gradients(zip(critic_grads, model.critic.trainable_variables))
         del tape
 
-        return (total_loss, loss, recon_loss, predictions, combined_input,
-                hidden, latent, quantum_entropy, gate_probs, episodic_memory, gating_signal, alignment_score, c_loss)
+        return (loss_value, recon_loss, predictions, combined_input,
+                hidden, latent, quantum_entropy, gate_probs, episodic_memory, gating_signal, alignment_score)
+
+    @tf.function
+    def val_step(val_iter, val_steps):
+        for step in range(val_steps):
+            val_images, val_labels = next(val_iter)
+            val_predictions, _, _, val_reconstruction, _, _, _, _, _, _, _ = model(val_images, training=False)
+            val_loss = loss_fn(val_labels, val_predictions)
+            val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
+            val_loss_metric.update_state(val_loss)
+            val_accuracy_metric.update_state(val_labels, val_predictions)
+            val_recon_loss_metric.update_state(val_recon_loss)        
+
+    @tf.function
+    def test_step(test_iter, teststeps):
+        for step in range(test_steps):
+            test_images, test_labels = next(test_iter)
+            test_predictions, _, _, test_reconstruction, _, _, _, _, _, _, _ = model(test_images, training=False)
+            test_loss = loss_fn(test_labels, test_predictions)
+            test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
+            test_loss_metric.update_state(test_loss)
+            test_accuracy_metric.update_state(test_labels, test_predictions)
+            test_recon_loss_metric.update_state(test_recon_loss)
 
     for epoch in range(num_epochs):
+        start_time = time.time()
         train_iter = iter(ds_train)
         val_iter = iter(ds_val)
         test_iter = iter(ds_test)
@@ -1143,25 +1175,31 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
 
         for step in range(train_steps):
             images, labels = next(train_iter)
-            (total_loss, loss_val, recon_loss_val, predictions, combined_input,
+            (loss_value, recon_loss, predictions, combined_input,
              hidden, latent, quantum_entropy, gate_probs, episodic_memory,
-             gating_signal, alignment_score, c_loss) = train_step(images, labels, plasticity_weight_val)
+             gating_signal, alignment_score) = train_step(images, labels, plasticity_weight_val)
 
             # Update metrics.
-            train_loss_metric(loss_val)
-            train_accuracy_metric(labels, predictions)
-            train_recon_loss_metric(recon_loss_val)
+            train_loss_metric.update_state(loss_value)
+            train_accuracy_metric.update_state(labels, predictions)
+            train_recon_loss_metric.update_state(recon_loss)
 
             # Update critic monitoring metrics.
-            mean_alignment_metric(alignment_score)
-            mean_gating_metric(gating_signal)            
+            mean_alignment_metric.update_state(alignment_score)
+            mean_gating_metric.update_state(gating_signal)
+
+            # Log every 100 steps.
+            if step % 100 == 0:
+                print(
+                    f"Training loss at step {step}/{train_steps}: {float(loss_value):.4f}"
+                )
 
             # Compute reinforcement signals and neuromodulatory factors.
             pre_activity = tf.reduce_mean(combined_input, axis=0)
             post_activity = tf.reduce_mean(hidden, axis=0)
             novelty = tf.math.reduce_std(hidden)
             avg_uncertainty = tf.reduce_mean(quantum_entropy)
-            combined_reward = model.reinforcement_layer(loss_val, recon_loss_val, novelty, avg_uncertainty)
+            combined_reward = model.reinforcement_layer(loss_value, recon_loss, novelty, avg_uncertainty)
             reward = combined_reward * global_reward_scaling_factor
             base_neuromod_signal = compute_neuromodulatory_signal(predictions, reward)
             latent_signal = tf.reduce_mean(compute_latent_mod(latent))
@@ -1211,14 +1249,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         train_recon_loss_metric.reset_state()
 
         # Validation Evaluation.
-        for step in range(val_steps):
-            val_images, val_labels = next(val_iter)
-            val_predictions, _, _, val_reconstruction, _, _, _, _, _, _, _ = model(val_images, training=False)
-            val_loss = loss_fn(val_labels, val_predictions)
-            val_recon_loss = recon_loss_fn(val_images, val_reconstruction)
-            val_loss_metric(val_loss)
-            val_accuracy_metric(val_labels, val_predictions)
-            val_recon_loss_metric(val_recon_loss)
+        val_step(val_iter, val_steps)
         current_val_loss = val_loss_metric.result().numpy()
         current_val_recon_loss = val_recon_loss_metric.result().numpy()
         print(f"Val Loss   : {current_val_loss:.4f}, "
@@ -1229,14 +1260,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
         val_recon_loss_metric.reset_state()
 
         # Test Evaluation.
-        for step in range(test_steps):
-            test_images, test_labels = next(test_iter)
-            test_predictions, _, _, test_reconstruction, _, _, _, _, _, _, _ = model(test_images, training=False)
-            test_loss = loss_fn(test_labels, test_predictions)
-            test_recon_loss = recon_loss_fn(test_images, test_reconstruction)
-            test_loss_metric(test_loss)
-            test_accuracy_metric(test_labels, test_predictions)
-            test_recon_loss_metric(test_recon_loss)
+        test_step(test_iter, test_steps)
         print(f"Test Loss  : {test_loss_metric.result():.4f}, "
               f"Test Accuracy  : {test_accuracy_metric.result():.4f}, "
               f"Test Recon Loss : {test_recon_loss_metric.result():.4f}")
@@ -1276,7 +1300,7 @@ def train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_s
                     model.set_weights(best_weights)
                     model.save(f"models/{model_name}.keras")
                 break
-
+        print(f"\nTime taken: {time.time() - start_time:.2f}s\n")
 # =========================================
 # Data Loading and Preprocessing Functions
 # =========================================
@@ -1328,7 +1352,7 @@ def create_tf_dataset(inputs, labels, h, w, batch_size=128, shuffle=False):
 # Main Function: Build dataset, instantiate controllers and model, then train
 # ============================================================================
 def main():
-    batch_size = 128
+    batch_size = 1024
     max_units = 64
     initial_units = 16
     epochs = 1000
@@ -1357,8 +1381,6 @@ def main():
     ds_val = create_tf_dataset(inp_val, lbl_val, h, w, batch_size)
     ds_test = create_tf_dataset(inp_test, lbl_test, h, w, batch_size)
     
-    # model.load_weights("model_weights/MetaSynapse_NextGen_v6c/model.weights.h5", skip_mismatch=True)
-
     # Warm-ups
     dummy_input1 = tf.zeros((1, h, w, 1))
     dummy_input2 = tf.zeros((h, w))    
@@ -1375,19 +1397,11 @@ def main():
     _ = model.chaotic_modulator(tf.zeros([2]), training=False)
     _ = model.hidden.experts[0](tf.random.normal((1, 384)), training=False)
     model.summary()
-    model_name = "MetaSynapse_NextGen_RL_v2"
+    # model.load_weights("model_weights/MetaSynapse_NextGen_RL_v2/model.weights.h5", skip_mismatch=True)
+    model_name = "MetaSynapse_NextGen_RL_v2b"
     train_model(model, model_name, ds_train, ds_val, ds_test, train_steps, val_steps, test_steps,
                 num_epochs=epochs, homeostasis_interval=13, architecture_update_interval=34,
                 plasticity_update_interval=5, plasticity_start_epoch=3, learning_rate=learning_rate)
-
-    # dummy_input = tf.random.normal((1, 32))
-    # dummy_layer = DynamicPlasticDenseDendritic(max_units=128, initial_units=32, plasticity_controller=model.meta_plasticity_controller)
-    # _ = dummy_layer(dummy_input)
-    # print(model.critic.update_threshold)  # Check that this is a tensor, not a string.
-    # print(model.meta_plasticity_controller.update_threshold)  # Check that this is a tensor, not a string.
-    # print(model.neural_ode_plasticity.dt)  # Check that this is a tensor, not a string.
-    # print(model.reinforcement_layer.w)  # Check that this is a tensor, not a string.
-    # print(model.chaotic_modulator.w)  # Check that this is a tensor, not a string.
     
 if __name__ == '__main__':
     main()
