@@ -43,7 +43,8 @@ class LearnedActivation(tf.keras.layers.Layer):
 # =============================================================================
 
 class PlasticDenseAdvanced(tf.keras.layers.Layer):
-    def __init__(self, units, prune_threshold=0.01, add_prob=0.001, **kwargs):
+    def __init__(self, units, prune_threshold=0.01, add_prob=0.001, initial_target=0.2,
+                 decay_factor=0.9, **kwargs):
         """
         units: number of neurons in the layer.
         prune_threshold: threshold below which synapses are pruned.
@@ -51,15 +52,21 @@ class PlasticDenseAdvanced(tf.keras.layers.Layer):
         """
         super(PlasticDenseAdvanced, self).__init__(**kwargs)
         self.units = units
-        # Use our custom LearnedActivation.
-        self.activation = LearnedActivation()
         self.prune_threshold = prune_threshold
         self.add_prob = add_prob
+        # Decay factor for homeostatic scaling
+        self.decay_factor = decay_factor        
+        # Use our custom LearnedActivation.
+        self.activation = LearnedActivation()
         # Meta-plasticity: a multiplicative factor for plasticity updates.
         self.meta_lr = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         # Trainable STDP amplitude parameters.
         self.A_plus = tf.Variable(0.01, trainable=True, dtype=tf.float32)
         self.A_minus = tf.Variable(0.01, trainable=True, dtype=tf.float32)
+        self.target_avg = tf.Variable(initial_target, trainable=False, dtype=tf.float32)
+        # Variables for tracking state
+        self.avg_weight_magnitude = tf.Variable(0.0, trainable=False, dtype=tf.float32)
+        self.sparsity = tf.Variable(0.0, trainable=False, dtype=tf.float32)        
 
     def build(self, input_shape):
         self.w = self.add_weight(
@@ -86,9 +93,9 @@ class PlasticDenseAdvanced(tf.keras.layers.Layer):
         - reward: scalar neuromodulatory signal in [0,1]
         """
         # Simulate a random spike timing difference delta_t (in ms) per weight element.
-        delta_t = tf.random.uniform(tf.shape(self.w), minval=-100.0, maxval=100.0)
-        tau_plus = 100.0
-        tau_minus = 100.0
+        delta_t = tf.random.uniform(tf.shape(self.w), minval=-20.0, maxval=20.0)
+        tau_plus = 40.0
+        tau_minus = 40.0
 
         # Use the trainable A_plus and A_minus variables.
         stdp_update = tf.where(delta_t > 0,
@@ -108,7 +115,8 @@ class PlasticDenseAdvanced(tf.keras.layers.Layer):
 
     def apply_homeostatic_scaling(self):
         avg_w = tf.reduce_mean(tf.abs(self.w))
-        target_avg = 0.05  # Target average weight.
+        new_target = self.decay_factor * self.target_avg + (1 - self.decay_factor) * avg_w
+        target_avg = new_target  # Target average weight.
         scaling_factor = target_avg / (avg_w + 1e-6)
         self.w.assign(self.w * scaling_factor)
 
@@ -128,6 +136,20 @@ class PlasticDenseAdvanced(tf.keras.layers.Layer):
         avg_update = tf.reduce_mean(tf.abs(plasticity_delta))
         new_meta_lr = tf.maximum(self.meta_lr * tf.exp(-0.01 * avg_update), 1e-5)
         self.meta_lr.assign(new_meta_lr)
+        
+    def adjust_prune_threshold(self):
+        # Increase threshold if sparsity is too high (too many weights are pruned)
+        if self.sparsity > 0.8:
+            self.prune_threshold.assign(self.prune_threshold * 1.05)  # Gradually increase prune threshold
+        elif self.sparsity < 0.3:
+            self.prune_threshold.assign(self.prune_threshold * 0.95)  # Gradually decrease prune threshold
+
+    def adjust_add_prob(self):
+        # Increase add_prob if weight magnitude is too low (not enough connections)
+        if self.avg_weight_magnitude < 0.01:
+            self.add_prob.assign(self.add_prob * 1.05)  # Gradually increase add_prob
+        elif self.avg_weight_magnitude > 0.1:
+            self.add_prob.assign(self.add_prob * 0.95)  # Gradually decrease add_prob        
 
     def compute_output_shape(self, input_shape):
         output_shape = list(input_shape)
